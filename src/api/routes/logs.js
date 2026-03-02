@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from "uuid";
 import { ingestBodySchema, searchQuerySchema } from "../../shared/schemas.js";
 import { ingestQueue } from "../../lib/queue.js";
 import { pool } from "../../lib/db.js";
+import { logger } from "../../lib/logger.js";
 
 export async function logsRoutes(app) {
   // Ingest logs (single or batch) -> queue
@@ -13,32 +14,39 @@ export async function logsRoutes(app) {
 
     const items = Array.isArray(parsed.data) ? parsed.data : [parsed.data];
 
-    const jobIds = [];
-    for (const l of items) {
-      const jobId = uuidv4();
-      const payload = {
-        ts: new Date(l.ts).toISOString(),
-        service: l.service,
-        env: l.env ?? "prod",
-        level: l.level,
-        message: l.message,
-        traceId: l.traceId,
-        spanId: l.spanId,
-        attrs: l.attrs ?? {},
-        context: l.context ?? {},
-        raw: l.raw ?? l,
-      };
+    try {
+      const ops = items.map(async (l) => {
+        const jobId = uuidv4();
+        const ts = isNaN(new Date(l.ts).getTime()) ? new Date().toISOString() : new Date(l.ts).toISOString();
+        const payload = {
+          ts,
+          service: l.service,
+          env: l.env ?? "prod",
+          level: l.level,
+          message: l.message,
+          traceId: l.traceId,
+          spanId: l.spanId,
+          attrs: l.attrs ?? {},
+          context: l.context ?? {},
+          raw: l.raw ?? l,
+        };
 
-      await pool.query(
-        "INSERT INTO ingest_jobs (job_id, status) VALUES ($1, 'queued') ON CONFLICT (job_id) DO NOTHING",
-        [jobId],
-      );
+        // record a queued job and enqueue concurrently
+        await pool.query(
+          "INSERT INTO ingest_jobs (job_id, status) VALUES ($1, 'queued') ON CONFLICT (job_id) DO NOTHING",
+          [jobId],
+        );
 
-      await ingestQueue.add("ingest", payload, { jobId });
-      jobIds.push(jobId);
+        await ingestQueue.add("ingest", payload, { jobId });
+        return jobId;
+      });
+
+      const jobIds = await Promise.all(ops);
+      return reply.code(202).send({ accepted: jobIds.length, jobIds });
+    } catch (err) {
+      logger.error({ err }, "failed to enqueue ingest job(s)");
+      return reply.code(500).send({ error: "internal_error" });
     }
-
-    return reply.code(202).send({ accepted: jobIds.length, jobIds });
   });
 
   app.get("/ingest/:jobId", async (req, reply) => {
