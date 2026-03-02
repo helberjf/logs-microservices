@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: logs
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs
+      REDIS_URL: redis://redis:6379
+      QUEUE_NAME: logs:ingest
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+      - redis
+    command: ["node", "src/api/server.js"]
+
+  worker:
+    build: .
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs
+      REDIS_URL: redis://redis:6379
+      QUEUE_NAME: logs:ingest
+    depends_on:
+      - postgres
+      - redis
+    command: ["node", "src/worker/worker.js"]
+
+volumes:
+  pgdata:
