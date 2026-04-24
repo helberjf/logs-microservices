@@ -4,15 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev:api": "node --watch --env-file=.env src/api/server.js",
-    "dev:worker": "node --watch --env-file=.env src/worker/worker.js",
-    "start:api": "node --env-file=.env src/api/server.js",
-    "start:worker": "node --env-file=.env src/worker/worker.js",
+    "dev:api": "node --watch src/api/server.js",
+    "dev:worker": "node --watch src/worker/worker.js",
+    "start:api": "node src/api/server.js",
+    "start:worker": "node src/worker/worker.js",
     "lint": "eslint .",
     "format": "prettier -w .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "migrate": "node --env-file=.env scripts/migrate.js"
+    "migrate": "node scripts/migrate.js"
   },
   "dependencies": {
     "bullmq": "^5.19.0",
