@@ -39,7 +39,7 @@ jobs:
         with:
           node-version: 20
           cache: "npm"
-      - run: npm install
+      - run: npm ci
       - name: Run migrations
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/logs

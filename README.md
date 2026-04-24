@@ -1,48 +1,106 @@
-# Logs Microservice (Ingest · Search · Stats)
+# Logs Microservice
 
-Lightweight microservice for collecting, storing and querying application logs.
+Microservico para ingestao, processamento assincrono, armazenamento, busca e agregacao de logs estruturados de aplicacoes.
 
-Features
-- Ingest logs via HTTP API
-- Asynchronous processing with BullMQ (Redis)
-- Persistent storage in PostgreSQL with full-text search (FTS)
-- Search API with filters and text queries
-- Stats endpoints for aggregated counts and timelines
-- Docker Compose for local development
-- Tests and CI workflow
+## Arquitetura
 
-Architecture
-
-```
-Client -> API (Fastify) -> BullMQ (Redis) -> Worker -> PostgreSQL
+```text
+Client -> Express REST API -> BullMQ/Redis -> Worker -> PostgreSQL
 ```
 
-Quickstart (local)
+O projeto separa a escrita em duas etapas:
 
-1. Install dependencies and copy example env:
+- A API valida o payload, registra um job em `ingest_jobs` e publica uma mensagem na fila.
+- O Worker consome a fila, persiste o log em `logs` e atualiza o status do job.
+
+Essa decisao evita que a latencia de escrita no banco seja acoplada ao tempo de resposta do endpoint de ingestao.
+
+## Recursos
+
+- API REST com Express.
+- Validacao de entrada com Zod.
+- Fila de ingestao com BullMQ e Redis.
+- Persistencia em PostgreSQL.
+- Busca por filtros, intervalo de tempo, level, texto e paginacao keyset.
+- Estatisticas por level e timeline por bucket de tempo.
+- Health checks de liveness e readiness.
+- Docker Compose com Postgres, Redis, migracao, API e Worker.
+- Testes automatizados com Vitest e CI no GitHub Actions.
+
+## Requisitos
+
+- Node.js 20+
+- npm
+- Docker e Docker Compose para ambiente local completo
+
+## Configuracao
+
+Copie o arquivo de exemplo:
 
 ```bash
-npm install
 cp .env.example .env
 ```
 
-2. Start DB and Redis, run migrations:
+Variaveis principais:
+
+- `PORT`: porta da API.
+- `API_KEY`: opcional. Quando preenchida, exige header `x-api-key`.
+- `DATABASE_URL`: conexao PostgreSQL.
+- `REDIS_URL`: conexao Redis.
+- `QUEUE_NAME`: nome da fila BullMQ. Use nomes sem `:`, por exemplo `logs-ingest`.
+
+## Rodando localmente
+
+Instale dependencias:
+
+```bash
+npm install
+```
+
+Suba Postgres e Redis:
 
 ```bash
 docker compose up -d postgres redis
+```
+
+Rode as migrations:
+
+```bash
 npm run migrate
 ```
 
-3. Run services for development:
+Inicie API e Worker em terminais separados:
 
 ```bash
-npm run dev:api    # API on http://localhost:3000
-npm run dev:worker # background worker
+npm run dev:api
+npm run dev:worker
 ```
 
-API Examples
+Tambem e possivel subir o stack completo com Compose:
 
-- Ingest a log entry:
+```bash
+docker compose up --build
+```
+
+Nesse modo, o servico `migrate` roda antes da API e do Worker.
+
+## Endpoints
+
+### Liveness
+
+```bash
+curl http://localhost:3000/health/liveness
+```
+
+### Readiness
+
+```bash
+curl http://localhost:3000/health/readiness
+```
+
+Retorna HTTP 503 quando PostgreSQL ou Redis nao estao prontos.
+
+### Ingestao de log
 
 ```bash
 curl -X POST http://localhost:3000/v1/logs \
@@ -53,66 +111,85 @@ curl -X POST http://localhost:3000/v1/logs \
     "env": "prod",
     "level": "info",
     "message": "payment approved",
+    "traceId": "trace-123",
     "attrs": {"orderId":"A1","userId":"U9"}
   }'
 ```
 
-- Search logs (query + filters):
+Resposta:
+
+```json
+{
+  "accepted": 1,
+  "jobIds": ["..."]
+}
+```
+
+### Status do job de ingestao
+
+```bash
+curl http://localhost:3000/v1/logs/ingest/JOB_ID
+```
+
+Status esperados: `queued`, `processing`, `processed` e `failed`.
+
+### Busca de logs
 
 ```bash
 curl "http://localhost:3000/v1/logs?service=billing-api&level=info&q=payment&limit=50"
 ```
 
-- Stats endpoint (bucketed counts):
+Filtros suportados:
+
+- `service`
+- `env`
+- `level`
+- `q`
+- `from`
+- `to`
+- `limit`
+- `cursorTs` e `cursorId` para proxima pagina
+
+### Estatisticas
 
 ```bash
-curl "http://localhost:3000/v1/stats?bucketMinutes=60"
+curl "http://localhost:3000/v1/stats?bucketMinutes=60&service=billing-api&env=prod"
 ```
 
-Environment
+Retorna:
 
-- Copy and edit `.env.example` to `.env` for local settings.
-- Key variables: `POSTGRES_URL`, `REDIS_URL`, `PORT` and BullMQ settings.
+- `byLevel`: contagem por level.
+- `timeline`: contagem por bucket de tempo e level.
 
-Testing
+## Banco de dados
+
+As migrations ficam em `migrations/`.
+
+Tabelas principais:
+
+- `logs`: entradas persistidas com campos estruturados e JSONB.
+- `ingest_jobs`: rastreia o ciclo de vida dos jobs de ingestao.
+- `schema_migrations`: controle simples de migrations aplicadas.
+
+Indices principais:
+
+- `(service, ts desc, id desc)` para buscas por servico.
+- `(level, ts desc, id desc)` para buscas por severidade.
+- `(ts desc, id desc)` para listagem recente e keyset pagination.
+- GIN em `to_tsvector('simple', message)` para full-text search.
+- GIN em `attrs` para evolucao futura de filtros em JSONB.
+
+## Testes e qualidade
 
 ```bash
 npm test
+npm run lint
 ```
 
-Contributing
+Os testes unitarios nao dependem de Redis/PostgreSQL quando estao validando apenas contrato HTTP. O teste de ingestao real fica protegido por `RUN_INTEGRATION=1`.
 
-- Open issues and PRs at https://github.com/helberjf/logs-microservices
-- Run linters and tests before submitting changes.
+## Documento tecnico
 
-License
+Para uma explicacao em formato de entrevista tecnica, leia:
 
-MIT
-
-Português (pt-BR)
-
-Microserviço leve para coletar, armazenar e consultar logs de aplicações.
-
-Recursos
-- Recebe logs via API HTTP
-- Processamento assíncrono com BullMQ (Redis)
-- Armazenamento em PostgreSQL com busca full-text (FTS)
-- API de busca com filtros e consultas de texto
-- Endpoints de estatísticas (contagens e agregações por intervalo)
-- `docker compose` para desenvolvimento local
-- Testes e CI
-
-Guia rápido (resumo)
-
-```bash
-npm install
-cp .env.example .env
-docker compose up -d postgres redis
-npm run migrate
-npm run dev:api
-npm run dev:worker
-```
-
-Mais detalhes e exemplos de rota estão em `src/api/routes/`.
-
----
+- `ENTREVISTA_TECNICA.md`

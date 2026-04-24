@@ -1,6 +1,13 @@
 import { z } from "zod";
 
-export const logLevelEnum = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
+export const logLevelEnum = z.enum([
+  "trace",
+  "debug",
+  "info",
+  "warn",
+  "error",
+  "fatal",
+]);
 
 export const ingestLogSchema = z.object({
   ts: z.string().datetime({ offset: true }),
@@ -15,19 +22,27 @@ export const ingestLogSchema = z.object({
   raw: z.any().optional(),
 });
 
-export const ingestBodySchema = z.union([ingestLogSchema, z.array(ingestLogSchema).min(1).max(500)]);
+export const ingestBodySchema = z.union([
+  ingestLogSchema,
+  z.array(ingestLogSchema).min(1).max(500),
+]);
 
-export const searchQuerySchema = z.object({
-  service: z.string().min(1).max(120).optional(),
-  env: z.string().min(1).max(40).optional(),
-  level: logLevelEnum.optional(),
-  q: z.string().min(1).max(200).optional(),
-  from: z.string().datetime({ offset: true }).optional(),
-  to: z.string().datetime({ offset: true }).optional(),
-  limit: z.coerce.number().int().min(1).max(200).default(50),
-  cursorTs: z.string().datetime({ offset: true }).optional(),
-  cursorId: z.coerce.number().int().positive().optional(),
-});
+export const searchQuerySchema = z
+  .object({
+    service: z.string().min(1).max(120).optional(),
+    env: z.string().min(1).max(40).optional(),
+    level: logLevelEnum.optional(),
+    q: z.string().min(1).max(200).optional(),
+    from: z.string().datetime({ offset: true }).optional(),
+    to: z.string().datetime({ offset: true }).optional(),
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+    cursorTs: z.string().datetime({ offset: true }).optional(),
+    cursorId: z.coerce.number().int().positive().optional(),
+  })
+  .refine((q) => Boolean(q.cursorTs) === Boolean(q.cursorId), {
+    message: "cursorTs and cursorId must be provided together",
+    path: ["cursor"],
+  });
 
 export const statsQuerySchema = z.object({
   service: z.string().min(1).max(120).optional(),

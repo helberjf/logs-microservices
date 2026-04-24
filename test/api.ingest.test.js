@@ -1,24 +1,29 @@
 import { describe, it, expect } from "vitest";
-import { buildServer } from "../src/api/server.js";
+import request from "supertest";
+import { buildServer, closeServerResources } from "../src/api/server.js";
 
 const integration = process.env.RUN_INTEGRATION === "1";
 
 describe("ingest", () => {
   it("rejects invalid body", async () => {
     const app = buildServer();
-    const res = await app.inject({ method: "POST", url: "/v1/logs", payload: { hello: "world" } });
-    expect(res.statusCode).toBe(400);
-    await app.close();
+    const res = await request(app).post("/v1/logs").send({ hello: "world" });
+    expect(res.status).toBe(400);
   });
 
   (integration ? it : it.skip)("accepts valid body (integration)", async () => {
     const app = buildServer();
-    const res = await app.inject({
-      method: "POST",
-      url: "/v1/logs",
-      payload: { ts: new Date().toISOString(), service: "api", env: "dev", level: "info", message: "hello" },
-    });
-    expect(res.statusCode).toBe(202);
-    await app.close();
+    try {
+      const res = await request(app).post("/v1/logs").send({
+        ts: new Date().toISOString(),
+        service: "api",
+        env: "dev",
+        level: "info",
+        message: "hello",
+      });
+      expect(res.status).toBe(202);
+    } finally {
+      await closeServerResources();
+    }
   });
 });

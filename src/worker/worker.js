@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Worker } from "bullmq";
+import { UnrecoverableError, Worker } from "bullmq";
 import { ingestLogSchema } from "../shared/schemas.js";
 import { redis } from "../lib/redis.js";
 import { config, must } from "../lib/config.js";
@@ -12,6 +12,10 @@ const worker = new Worker(
   config.queueName,
   async (job) => {
     const jobId = job.id;
+    await pool.query(
+      "UPDATE ingest_jobs SET status = 'processing', error = NULL WHERE job_id = $1",
+      [jobId],
+    );
 
     const parsed = ingestLogSchema.safeParse(job.data);
     if (!parsed.success) {
@@ -20,7 +24,7 @@ const worker = new Worker(
         "UPDATE ingest_jobs SET status = 'failed', processed_at = now(), error = $2 WHERE job_id = $1",
         [jobId, msg],
       );
-      throw new Error(msg);
+      throw new UnrecoverableError(msg);
     }
 
     const l = parsed.data;
@@ -44,19 +48,50 @@ const worker = new Worker(
       ],
     );
 
-    await pool.query("UPDATE ingest_jobs SET status = 'processed', processed_at = now() WHERE job_id = $1", [jobId]);
+    await pool.query(
+      "UPDATE ingest_jobs SET status = 'processed', processed_at = now() WHERE job_id = $1",
+      [jobId],
+    );
     return { ok: true };
   },
   { connection: redis, concurrency: 10 },
 );
 
-worker.on("completed", (job) => logger.debug({ jobId: job.id }, "job completed"));
-worker.on("failed", (job, err) => logger.error({ jobId: job?.id, err }, "job failed"));
+worker.on("completed", (job) =>
+  logger.debug({ jobId: job.id }, "job completed"),
+);
+worker.on("failed", (job, err) => {
+  logger.error({ jobId: job?.id, err }, "job failed");
 
-process.on("SIGINT", async () => {
-  logger.info("worker shutting down...");
+  if (!job?.id) return;
+  const maxAttempts = job.opts.attempts ?? 1;
+  if (job.attemptsMade < maxAttempts) return;
+
+  pool
+    .query(
+      "UPDATE ingest_jobs SET status = 'failed', processed_at = now(), error = $2 WHERE job_id = $1",
+      [job.id, err instanceof Error ? err.message : String(err)],
+    )
+    .catch((updateErr) =>
+      logger.error(
+        { jobId: job.id, err: updateErr },
+        "failed to update ingest job status",
+      ),
+    );
+});
+
+async function shutdown(signal) {
+  logger.info({ signal }, "worker shutting down...");
   await worker.close();
   await pool.end();
   await redis.quit();
   process.exit(0);
+}
+
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
 });

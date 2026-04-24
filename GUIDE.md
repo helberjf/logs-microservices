@@ -1,65 +1,65 @@
-# Guide to Logs Microservices Project
+# Guia do Projeto
 
-## Overview
+Este guia complementa o README com uma visao pratica de operacao e manutencao.
 
-This project is designed to provide a robust, scalable logging solution for microservices architecture. It aims to centralize logs for easier monitoring and debugging.
+## Componentes
 
-## Components
+- `src/api/server.js`: cria a API REST com Express, registra middlewares, rotas e shutdown gracioso.
+- `src/api/routes/logs.js`: ingestao, status de job, busca e detalhe de log.
+- `src/api/routes/stats.js`: agregacoes por level e timeline.
+- `src/api/routes/health.js`: liveness e readiness.
+- `src/worker/worker.js`: consumidor BullMQ que grava logs no PostgreSQL.
+- `src/shared/schemas.js`: contratos Zod usados pela API e pelo Worker.
+- `src/lib/*`: configuracao, logger, conexoes de banco, Redis e fila.
+- `migrations/*`: schema e indices.
+- `scripts/migrate.js`: runner simples de migrations SQL.
 
-- **Service A**: Responsible for collecting logs from microservices and sending them to the central logging service.
-- **Service B**: Manages log storage and provides a REST API for querying logs.
-- **Service C**: A simple dashboard to visualize logs in real-time.
+## Fluxo de ingestao
 
-## Technical Decisions
+1. Cliente envia `POST /v1/logs`.
+2. API valida o payload com Zod.
+3. API grava o job em `ingest_jobs` com status `queued`.
+4. API publica a mensagem no BullMQ.
+5. Worker consome o job e muda status para `processing`.
+6. Worker insere o registro em `logs`.
+7. Worker muda status para `processed`.
+8. Em erro definitivo, Worker marca `failed` e salva a mensagem de erro.
 
-- **Log Format**: JSON with structured data for easier parsing and analysis.
-- **Communication Protocol**: HTTP for Service A and B, WebSocket for real-time updates in Service C.
-- **Database**: PostgreSQL for storing logs to ensure data integrity and performance.
+## Fluxo de busca
 
-## Trade-offs
+`GET /v1/logs` monta uma query SQL parametrizada a partir dos filtros recebidos. A ordenacao usa `ts desc, id desc`, o que permite paginacao keyset sem custo crescente de `OFFSET`.
 
-- **Performance vs. Storage**: Choosing a more performant database comes with a cost in terms of storage and maintenance.
-- **Complexity vs. Maintainability**: More complex solutions can be harder to maintain but offer more flexibility.
+Quando a resposta traz `nextCursor`, envie `cursorTs` e `cursorId` juntos na proxima chamada.
 
-## How to Run
+## Operacao local
 
-1. **Clone the Repository**:
-   ```sh
-   git clone https://github.com/yourusername/logs-microservices.git
-   ```
+Ambiente minimo:
 
-2. **Navigate to the Directory**:
-   ```sh
-   cd logs-microservices
-   ```
+```bash
+npm install
+docker compose up -d postgres redis
+npm run migrate
+npm run dev:api
+npm run dev:worker
+```
 
-3. **Setup Environment Variables**:
-   ```sh
-   cp .env.example .env
-   ```
+Stack completo:
 
-4. **Install Dependencies**:
-   ```sh
-   npm install
-   ```
+```bash
+docker compose up --build
+```
 
-5. **Start the Services**:
-   - **Service A**:
-     ```sh
-     npm run service-a
-     ```
-   - **Service B**:
-     ```sh
-     npm run service-b
-     ```
-   - **Service C**:
-     ```sh
-     npm run service-c
-     ```
+## Comandos uteis
 
-6. **Access the Dashboard**:
-   - Open your browser and navigate to `http://localhost:3000`.
+```bash
+npm test
+npm run lint
+npm run migrate
+```
 
-## Contributing
+## Cuidados
 
-Feel free to contribute by submitting issues or pull requests. We welcome any improvements or suggestions.
+- `QUEUE_NAME` nao deve conter `:` porque BullMQ reserva esse caractere internamente.
+- Deixe `API_KEY` vazio em desenvolvimento se nao quiser exigir `x-api-key`.
+- Rode migrations antes de iniciar API/Worker fora do Compose completo.
+- `COUNT(*)::bigint` volta como string no driver `pg`; isso evita perda de precisao em contagens grandes.

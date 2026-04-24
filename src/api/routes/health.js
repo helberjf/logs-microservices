@@ -1,12 +1,21 @@
+import { Router } from "express";
 import { dbHealthcheck } from "../../lib/db.js";
 import { redis } from "../../lib/redis.js";
 
-export async function healthRoutes(app) {
-  app.get("/liveness", async () => ({ ok: true }));
+export const healthRouter = Router();
 
-  app.get("/readiness", async () => {
-    const dbOk = await dbHealthcheck().catch(() => false);
-    const redisOk = await redis.ping().then((r) => r === "PONG").catch(() => false);
-    return { ok: dbOk && redisOk, dbOk, redisOk };
-  });
-}
+healthRouter.get("/liveness", (_req, res) => {
+  res.json({ ok: true });
+});
+
+healthRouter.get("/readiness", async (_req, res) => {
+  const dbOk = await dbHealthcheck().catch(() => false);
+  const redisOk = await redis
+    .ping()
+    .then((r) => r === "PONG")
+    .catch(() => false);
+
+  res
+    .status(dbOk && redisOk ? 200 : 503)
+    .json({ ok: dbOk && redisOk, dbOk, redisOk });
+});

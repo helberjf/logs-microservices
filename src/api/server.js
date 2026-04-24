@@ -1,38 +1,72 @@
-import Fastify from "fastify";
-import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
-import cors from "@fastify/cors";
+import express from "express";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import cors from "cors";
 import { logger } from "../lib/logger.js";
 import { config } from "../lib/config.js";
-import { healthRoutes } from "./routes/health.js";
-import { logsRoutes } from "./routes/logs.js";
-import { statsRoutes } from "./routes/stats.js";
+import { pool } from "../lib/db.js";
+import { closeIngestQueue } from "../lib/queue.js";
+import { redis } from "../lib/redis.js";
+import { healthRouter } from "./routes/health.js";
+import { logsRouter } from "./routes/logs.js";
+import { statsRouter } from "./routes/stats.js";
 
 export function buildServer() {
-  const app = Fastify({ logger });
+  const app = express();
 
-  app.register(helmet);
-  app.register(cors, { origin: true });
-  app.register(rateLimit, { max: 600, timeWindow: "1 minute" });
+  app.use(helmet());
+  app.use(cors({ origin: true }));
+  app.use(rateLimit({ limit: 600, windowMs: 60 * 1000 }));
+  app.use(express.json({ limit: "1mb" }));
 
-  // Optional API key gate
-  app.addHook("onRequest", async (req, reply) => {
-    if (!config.apiKey) return;
-    const key = req.headers["x-api-key"];
-    if (key !== config.apiKey) reply.code(401).send({ error: "Unauthorized" });
+  app.use((req, res, next) => {
+    if (!config.apiKey) return next();
+    if (req.header("x-api-key") !== config.apiKey) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    return next();
   });
 
-  app.register(healthRoutes, { prefix: "/health" });
-  app.register(logsRoutes, { prefix: "/v1/logs" });
-  app.register(statsRoutes, { prefix: "/v1/stats" });
+  app.use("/health", healthRouter);
+  app.use("/v1/logs", logsRouter);
+  app.use("/v1/stats", statsRouter);
+
+  app.use((err, _req, res, _next) => {
+    logger.error({ err }, "unhandled API error");
+    if (res.headersSent) return;
+    res.status(500).json({ error: "internal_error" });
+  });
 
   return app;
 }
 
+export async function closeServerResources() {
+  await closeIngestQueue();
+}
+
 async function main() {
   const app = buildServer();
-  await app.listen({ port: config.port, host: "0.0.0.0" });
-  app.log.info({ port: config.port }, "API started");
+  const server = app.listen(config.port, "0.0.0.0", () => {
+    logger.info({ port: config.port }, "API started");
+  });
+
+  async function shutdown(signal) {
+    logger.info({ signal }, "API shutting down...");
+    server.close(async () => {
+      await closeServerResources();
+      await pool.end();
+      await redis.quit().catch(() => redis.disconnect());
+      process.exit(0);
+    });
+  }
+
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
 }
 
 if (process.env.VITEST !== "true") {
