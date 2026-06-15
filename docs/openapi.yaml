@@ -1,0 +1,623 @@
+openapi: 3.0.3
+info:
+  title: Logs Microservice API
+  version: 0.1.0
+  description: |
+    REST API for structured log ingestion, asynchronous processing, search,
+    aggregation, and operational health checks.
+
+    Authentication is optional at runtime. When API_KEY is configured, clients
+    must send the x-api-key header documented below.
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+tags:
+  - name: Health
+    description: Service liveness and dependency readiness checks
+  - name: Logs
+    description: Log ingestion, ingest job status, search, and detail lookup
+  - name: Stats
+    description: Aggregations for operational analysis
+
+security:
+  - {}
+  - ApiKeyAuth: []
+
+paths:
+  /health/liveness:
+    get:
+      tags: [Health]
+      summary: Check if the API process is alive
+      operationId: getLiveness
+      responses:
+        "200":
+          description: API process is running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LivenessResponse"
+              example:
+                ok: true
+
+  /health/readiness:
+    get:
+      tags: [Health]
+      summary: Check if dependencies are ready
+      operationId: getReadiness
+      responses:
+        "200":
+          description: PostgreSQL and Redis are reachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+              example:
+                ok: true
+                dbOk: true
+                redisOk: true
+        "503":
+          description: At least one dependency is not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+              example:
+                ok: false
+                dbOk: true
+                redisOk: false
+
+  /v1/logs:
+    post:
+      tags: [Logs]
+      summary: Accept one or more logs for asynchronous ingestion
+      operationId: ingestLogs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/IngestLog"
+                - type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    $ref: "#/components/schemas/IngestLog"
+            examples:
+              single:
+                summary: Single structured log
+                value:
+                  ts: "2026-03-02T10:00:00.000Z"
+                  service: billing-api
+                  env: prod
+                  level: info
+                  message: payment approved
+                  traceId: trace-123
+                  attrs:
+                    orderId: A1
+                    userId: U9
+              batch:
+                summary: Batch ingestion
+                value:
+                  - ts: "2026-03-02T10:00:00.000Z"
+                    service: billing-api
+                    env: prod
+                    level: info
+                    message: payment approved
+                  - ts: "2026-03-02T10:01:00.000Z"
+                    service: billing-api
+                    env: prod
+                    level: warn
+                    message: payment retry requested
+      responses:
+        "202":
+          description: Logs were validated, registered as ingest jobs, and queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestAcceptedResponse"
+              example:
+                accepted: 1
+                jobIds:
+                  - 4df7e9c5-d52f-41f8-bdd2-61c9163f8d55
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    get:
+      tags: [Logs]
+      summary: Search persisted logs
+      description: |
+        Returns logs ordered by ts desc and id desc. Pagination uses a keyset
+        cursor: pass cursorTs and cursorId together from the previous response.
+      operationId: searchLogs
+      parameters:
+        - $ref: "#/components/parameters/Service"
+        - $ref: "#/components/parameters/Env"
+        - $ref: "#/components/parameters/Level"
+        - name: q
+          in: query
+          description: Full-text search term applied to the message field
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+          example: payment
+        - name: from
+          in: query
+          description: Inclusive ISO-8601 lower timestamp bound
+          schema:
+            type: string
+            format: date-time
+          example: "2026-03-02T00:00:00.000Z"
+        - name: to
+          in: query
+          description: Inclusive ISO-8601 upper timestamp bound
+          schema:
+            type: string
+            format: date-time
+          example: "2026-03-03T00:00:00.000Z"
+        - name: limit
+          in: query
+          description: Maximum number of logs to return
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          example: 50
+        - name: cursorTs
+          in: query
+          description: Timestamp from nextCursor; must be sent with cursorId
+          schema:
+            type: string
+            format: date-time
+          example: "2026-03-02T10:00:00.000Z"
+        - name: cursorId
+          in: query
+          description: ID from nextCursor; must be sent with cursorTs
+          schema:
+            type: integer
+            minimum: 1
+          example: 123
+      responses:
+        "200":
+          description: Search results and optional next page cursor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchLogsResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/logs/ingest/{jobId}:
+    get:
+      tags: [Logs]
+      summary: Get the status of an asynchronous ingest job
+      operationId: getIngestJob
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: 4df7e9c5-d52f-41f8-bdd2-61c9163f8d55
+      responses:
+        "200":
+          description: Ingest job state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestJob"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/logs/{id}:
+    get:
+      tags: [Logs]
+      summary: Get a persisted log by numeric ID
+      operationId: getLogById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          example: 123
+      responses:
+        "200":
+          description: Persisted log detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogDetail"
+        "400":
+          description: Invalid numeric ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: Invalid id
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/stats:
+    get:
+      tags: [Stats]
+      summary: Get counts by level and timeline buckets
+      operationId: getStats
+      parameters:
+        - $ref: "#/components/parameters/Service"
+        - $ref: "#/components/parameters/Env"
+        - name: from
+          in: query
+          description: Inclusive ISO-8601 lower timestamp bound; defaults to 24h ago
+          schema:
+            type: string
+            format: date-time
+          example: "2026-03-02T00:00:00.000Z"
+        - name: to
+          in: query
+          description: Inclusive ISO-8601 upper timestamp bound; defaults to now
+          schema:
+            type: string
+            format: date-time
+          example: "2026-03-03T00:00:00.000Z"
+        - name: bucketMinutes
+          in: query
+          description: Timeline bucket size in minutes
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1440
+            default: 60
+          example: 60
+      responses:
+        "200":
+          description: Aggregated log statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Required only when API_KEY is configured in the environment.
+
+  parameters:
+    Service:
+      name: service
+      in: query
+      description: Service that emitted the log
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 120
+      example: billing-api
+    Env:
+      name: env
+      in: query
+      description: Runtime environment
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 40
+      example: prod
+    Level:
+      name: level
+      in: query
+      description: Log severity level
+      schema:
+        $ref: "#/components/schemas/LogLevel"
+      example: info
+
+  responses:
+    ValidationError:
+      description: Request body or query string did not match the API contract
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ValidationError"
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Unauthorized
+    NotFound:
+      description: Resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Not found
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: internal_error
+
+  schemas:
+    LogLevel:
+      type: string
+      enum: [trace, debug, info, warn, error, fatal]
+
+    JsonObject:
+      type: object
+      additionalProperties: true
+
+    IngestLog:
+      type: object
+      required: [ts, service, level, message]
+      additionalProperties: false
+      properties:
+        ts:
+          type: string
+          format: date-time
+          description: Event timestamp with timezone offset
+          example: "2026-03-02T10:00:00.000Z"
+        service:
+          type: string
+          minLength: 1
+          maxLength: 120
+          example: billing-api
+        env:
+          type: string
+          minLength: 1
+          maxLength: 40
+          default: prod
+          example: prod
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        message:
+          type: string
+          minLength: 1
+          maxLength: 20000
+          example: payment approved
+        traceId:
+          type: string
+          maxLength: 128
+          example: trace-123
+        spanId:
+          type: string
+          maxLength: 128
+          example: span-456
+        attrs:
+          $ref: "#/components/schemas/JsonObject"
+        context:
+          $ref: "#/components/schemas/JsonObject"
+        raw:
+          description: Original log payload or additional raw source data
+          nullable: true
+
+    IngestAcceptedResponse:
+      type: object
+      required: [accepted, jobIds]
+      properties:
+        accepted:
+          type: integer
+          minimum: 1
+          example: 1
+        jobIds:
+          type: array
+          items:
+            type: string
+          example:
+            - 4df7e9c5-d52f-41f8-bdd2-61c9163f8d55
+
+    IngestStatus:
+      type: string
+      enum: [queued, processing, processed, failed]
+
+    IngestJob:
+      type: object
+      required: [job_id, received_at, status]
+      properties:
+        job_id:
+          type: string
+          example: 4df7e9c5-d52f-41f8-bdd2-61c9163f8d55
+        received_at:
+          type: string
+          format: date-time
+        processed_at:
+          type: string
+          format: date-time
+          nullable: true
+        status:
+          $ref: "#/components/schemas/IngestStatus"
+        error:
+          type: string
+          nullable: true
+
+    LogItem:
+      type: object
+      required: [id, ts, service, env, level, message, attrs, context]
+      properties:
+        id:
+          type: integer
+          example: 123
+        ts:
+          type: string
+          format: date-time
+        service:
+          type: string
+          example: billing-api
+        env:
+          type: string
+          example: prod
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        message:
+          type: string
+          example: payment approved
+        trace_id:
+          type: string
+          nullable: true
+          example: trace-123
+        span_id:
+          type: string
+          nullable: true
+          example: span-456
+        attrs:
+          $ref: "#/components/schemas/JsonObject"
+        context:
+          $ref: "#/components/schemas/JsonObject"
+
+    LogDetail:
+      allOf:
+        - $ref: "#/components/schemas/LogItem"
+        - type: object
+          required: [raw]
+          properties:
+            raw:
+              $ref: "#/components/schemas/JsonObject"
+
+    SearchCursor:
+      type: object
+      required: [cursorTs, cursorId]
+      properties:
+        cursorTs:
+          type: string
+          format: date-time
+        cursorId:
+          type: integer
+          minimum: 1
+
+    SearchLogsResponse:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogItem"
+        nextCursor:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/SearchCursor"
+
+    StatsRange:
+      type: object
+      required: [from, to, bucketMinutes]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        bucketMinutes:
+          type: integer
+          example: 60
+
+    CountByLevel:
+      type: object
+      required: [level, count]
+      properties:
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        count:
+          type: string
+          description: PostgreSQL bigint count returned as a string by pg
+          example: "42"
+
+    TimelineBucket:
+      type: object
+      required: [bucket_start, level, count]
+      properties:
+        bucket_start:
+          type: string
+          format: date-time
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        count:
+          type: string
+          description: PostgreSQL bigint count returned as a string by pg
+          example: "10"
+
+    StatsResponse:
+      type: object
+      required: [range, byLevel, timeline]
+      properties:
+        range:
+          $ref: "#/components/schemas/StatsRange"
+        byLevel:
+          type: array
+          items:
+            $ref: "#/components/schemas/CountByLevel"
+        timeline:
+          type: array
+          items:
+            $ref: "#/components/schemas/TimelineBucket"
+
+    LivenessResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    ReadinessResponse:
+      type: object
+      required: [ok, dbOk, redisOk]
+      properties:
+        ok:
+          type: boolean
+        dbOk:
+          type: boolean
+          description: PostgreSQL health check result
+        redisOk:
+          type: boolean
+          description: Redis health check result
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    ValidationError:
+      type: object
+      required: [error, details]
+      properties:
+        error:
+          type: string
+          example: Invalid payload
+        details:
+          type: object
+          additionalProperties: true

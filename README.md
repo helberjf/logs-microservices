@@ -1,37 +1,85 @@
 # Logs Microservice
 
-Microservico para ingestao, processamento assincrono, armazenamento, busca e agregacao de logs estruturados de aplicacoes.
+Microservico para ingestao, processamento assincrono, armazenamento, busca e
+agregacao de logs estruturados.
 
-## Arquitetura
+O projeto simula uma plataforma pequena de observabilidade: varias aplicacoes
+enviam logs por HTTP, a API valida e enfileira os eventos, um Worker persiste os
+dados em PostgreSQL e a API oferece endpoints para busca, detalhe, status de
+ingestao e estatisticas.
+
+## Visao Geral
 
 ```text
-Client -> Express REST API -> BullMQ/Redis -> Worker -> PostgreSQL
+Client
+  |
+  v
+Express REST API
+  |
+  | cria ingest_jobs + publica job
+  v
+BullMQ / Redis
+  |
+  | Worker consome com retry/backoff
+  v
+PostgreSQL
 ```
 
-O projeto separa a escrita em duas etapas:
+Por que essa arquitetura?
 
-- A API valida o payload, registra um job em `ingest_jobs` e publica uma mensagem na fila.
-- O Worker consome a fila, persiste o log em `logs` e atualiza o status do job.
+- A API responde rapido com `202 Accepted` depois de validar e enfileirar.
+- A escrita no banco fica desacoplada da latencia do cliente.
+- Redis/BullMQ entrega fila, retry, backoff e concorrencia do Worker.
+- PostgreSQL guarda logs estruturados, JSONB, busca textual simples e agregacoes.
+- Health checks, migrations, Docker e CI deixam o projeto mais proximo de um
+  servico real.
 
-Essa decisao evita que a latencia de escrita no banco seja acoplada ao tempo de resposta do endpoint de ingestao.
+## Stack
+
+- Node.js 20+
+- Express 5
+- Zod
+- BullMQ
+- Redis
+- PostgreSQL
+- Pino
+- Vitest + Supertest
+- Docker Compose
+- GitHub Actions
 
 ## Recursos
 
-- API REST com Express.
-- Validacao de entrada com Zod.
-- Fila de ingestao com BullMQ e Redis.
-- Persistencia em PostgreSQL.
-- Busca por filtros, intervalo de tempo, level, texto e paginacao keyset.
+- API REST com validacao de contratos.
+- Ingestao individual ou em lote, com limite de 500 logs por request.
+- Processamento assincrono via fila.
+- Status de ingestao: `queued`, `processing`, `processed`, `failed`.
+- Busca por `service`, `env`, `level`, texto, intervalo de tempo e cursor.
+- Paginacao keyset com `cursorTs` e `cursorId`.
 - Estatisticas por level e timeline por bucket de tempo.
 - Health checks de liveness e readiness.
-- Docker Compose com Postgres, Redis, migracao, API e Worker.
-- Testes automatizados com Vitest e CI no GitHub Actions.
+- OpenAPI/Swagger em `docs/openapi.yaml`.
+- Documentacao tecnica para entrevista em `ENTREVISTA_TECNICA.md`.
 
-## Requisitos
+## Documentacao da API
 
-- Node.js 20+
-- npm
-- Docker e Docker Compose para ambiente local completo
+A especificacao OpenAPI esta em:
+
+```text
+docs/openapi.yaml
+```
+
+Voce pode abrir esse arquivo no Swagger Editor, Insomnia, Postman ou qualquer
+ferramenta compativel com OpenAPI 3.0.
+
+Endpoints documentados:
+
+- `GET /health/liveness`
+- `GET /health/readiness`
+- `POST /v1/logs`
+- `GET /v1/logs`
+- `GET /v1/logs/ingest/{jobId}`
+- `GET /v1/logs/{id}`
+- `GET /v1/stats`
 
 ## Configuracao
 
@@ -41,17 +89,37 @@ Copie o arquivo de exemplo:
 cp .env.example .env
 ```
 
-Variaveis principais:
+Variaveis:
 
-- `PORT`: porta da API.
-- `API_KEY`: opcional. Quando preenchida, exige header `x-api-key`.
-- `DATABASE_URL`: conexao PostgreSQL.
-- `REDIS_URL`: conexao Redis.
-- `QUEUE_NAME`: nome da fila BullMQ. Use nomes sem `:`, por exemplo `logs-ingest`.
+| Variavel | Exemplo | Descricao |
+| --- | --- | --- |
+| `PORT` | `3000` | Porta HTTP da API |
+| `NODE_ENV` | `development` | Ambiente da aplicacao |
+| `API_KEY` | vazio | Opcional; quando preenchida exige header `x-api-key` |
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/logs?sslmode=disable` | Conexao PostgreSQL |
+| `REDIS_URL` | `redis://localhost:6379` | Conexao Redis |
+| `QUEUE_NAME` | `logs-ingest` | Nome da fila BullMQ; evite `:` no nome |
 
-## Rodando localmente
+## Rodando com Docker Compose
 
-Instale dependencias:
+Para subir Postgres, Redis, migrations, API e Worker:
+
+```bash
+docker compose up --build
+```
+
+O Compose executa o servico `migrate` antes de iniciar API e Worker.
+
+Teste a API:
+
+```bash
+curl http://localhost:3000/health/liveness
+curl http://localhost:3000/health/readiness
+```
+
+## Rodando em Desenvolvimento
+
+Instale as dependencias:
 
 ```bash
 npm install
@@ -76,31 +144,9 @@ npm run dev:api
 npm run dev:worker
 ```
 
-Tambem e possivel subir o stack completo com Compose:
+## Exemplos de Uso
 
-```bash
-docker compose up --build
-```
-
-Nesse modo, o servico `migrate` roda antes da API e do Worker.
-
-## Endpoints
-
-### Liveness
-
-```bash
-curl http://localhost:3000/health/liveness
-```
-
-### Readiness
-
-```bash
-curl http://localhost:3000/health/readiness
-```
-
-Retorna HTTP 503 quando PostgreSQL ou Redis nao estao prontos.
-
-### Ingestao de log
+### Ingerir Um Log
 
 ```bash
 curl -X POST http://localhost:3000/v1/logs \
@@ -112,7 +158,10 @@ curl -X POST http://localhost:3000/v1/logs \
     "level": "info",
     "message": "payment approved",
     "traceId": "trace-123",
-    "attrs": {"orderId":"A1","userId":"U9"}
+    "attrs": {
+      "orderId": "A1",
+      "userId": "U9"
+    }
   }'
 ```
 
@@ -121,34 +170,40 @@ Resposta:
 ```json
 {
   "accepted": 1,
-  "jobIds": ["..."]
+  "jobIds": ["4df7e9c5-d52f-41f8-bdd2-61c9163f8d55"]
 }
 ```
 
-### Status do job de ingestao
+### Consultar Status do Job
 
 ```bash
-curl http://localhost:3000/v1/logs/ingest/JOB_ID
+curl http://localhost:3000/v1/logs/ingest/4df7e9c5-d52f-41f8-bdd2-61c9163f8d55
 ```
 
-Status esperados: `queued`, `processing`, `processed` e `failed`.
+Resposta esperada depois do Worker processar:
 
-### Busca de logs
+```json
+{
+  "job_id": "4df7e9c5-d52f-41f8-bdd2-61c9163f8d55",
+  "received_at": "2026-03-02T10:00:00.000Z",
+  "processed_at": "2026-03-02T10:00:01.000Z",
+  "status": "processed",
+  "error": null
+}
+```
+
+### Buscar Logs
 
 ```bash
 curl "http://localhost:3000/v1/logs?service=billing-api&level=info&q=payment&limit=50"
 ```
 
-Filtros suportados:
+A resposta inclui `nextCursor` quando existe uma proxima pagina. Para continuar,
+envie `cursorTs` e `cursorId` juntos:
 
-- `service`
-- `env`
-- `level`
-- `q`
-- `from`
-- `to`
-- `limit`
-- `cursorTs` e `cursorId` para proxima pagina
+```bash
+curl "http://localhost:3000/v1/logs?service=billing-api&limit=50&cursorTs=2026-03-02T10:00:00.000Z&cursorId=123"
+```
 
 ### Estatisticas
 
@@ -158,38 +213,81 @@ curl "http://localhost:3000/v1/stats?bucketMinutes=60&service=billing-api&env=pr
 
 Retorna:
 
-- `byLevel`: contagem por level.
-- `timeline`: contagem por bucket de tempo e level.
+- `byLevel`: contagem por severidade.
+- `timeline`: contagem por bucket de tempo e severidade.
 
-## Banco de dados
+## Modelo de Dados
 
 As migrations ficam em `migrations/`.
 
-Tabelas principais:
+Tabelas:
 
-- `logs`: entradas persistidas com campos estruturados e JSONB.
-- `ingest_jobs`: rastreia o ciclo de vida dos jobs de ingestao.
-- `schema_migrations`: controle simples de migrations aplicadas.
+- `logs`: eventos persistidos, com campos estruturados e colunas JSONB.
+- `ingest_jobs`: rastreia o ciclo de vida dos jobs assincronos.
+- `schema_migrations`: registra migrations aplicadas.
 
 Indices principais:
 
-- `(service, ts desc, id desc)` para buscas por servico.
-- `(level, ts desc, id desc)` para buscas por severidade.
-- `(ts desc, id desc)` para listagem recente e keyset pagination.
-- GIN em `to_tsvector('simple', message)` para full-text search.
-- GIN em `attrs` para evolucao futura de filtros em JSONB.
+- `(service, ts desc, id desc)` para busca por servico.
+- `(level, ts desc, id desc)` para busca por severidade.
+- `(ts desc, id desc)` para listagem recente e paginacao keyset.
+- GIN em `to_tsvector('simple', message)` para busca textual.
+- GIN em `attrs` para evolucao futura de filtros por JSONB.
+- Indice parcial em `trace_id` para correlacao distribuida.
 
-## Testes e qualidade
+## Testes e Qualidade
 
 ```bash
 npm test
 npm run lint
 ```
 
-Os testes unitarios nao dependem de Redis/PostgreSQL quando estao validando apenas contrato HTTP. O teste de ingestao real fica protegido por `RUN_INTEGRATION=1`.
+Os testes HTTP usam Vitest e Supertest. Eles validam contratos sem abrir um
+servidor real. O teste de integracao completa fica protegido por
+`RUN_INTEGRATION=1`, pois depende de PostgreSQL e Redis.
 
-## Documento tecnico
+No CI, o GitHub Actions sobe PostgreSQL e Redis, roda as migrations e executa a
+suite de testes.
 
-Para uma explicacao em formato de entrevista tecnica, leia:
+## Estrutura
+
+```text
+src/
+  api/
+    routes/
+      health.js
+      logs.js
+      stats.js
+    server.js
+  lib/
+    config.js
+    db.js
+    logger.js
+    queue.js
+    redis.js
+  shared/
+    schemas.js
+  worker/
+    worker.js
+migrations/
+docs/
+  openapi.yaml
+scripts/
+  migrate.js
+test/
+```
+
+## Como Explicar em Entrevista
+
+Um bom resumo:
+
+> "Eu construi um pipeline de logs com API REST, fila e Worker. A API valida o
+> payload com Zod, registra um job no PostgreSQL e publica no BullMQ. O Worker
+> consome da fila com retry/backoff, persiste o log e atualiza o status. A busca
+> usa filtros SQL parametrizados, full-text search simples e paginacao keyset.
+> Tambem inclui migrations, Docker Compose, health checks, CI, testes e contrato
+> OpenAPI."
+
+Para uma explicacao detalhada, leia:
 
 - `ENTREVISTA_TECNICA.md`

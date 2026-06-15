@@ -1,234 +1,648 @@
 # Entrevista Tecnica - Logs Microservice
 
-Este documento explica o projeto como eu apresentaria para um entrevistador tecnico senior.
+Este documento e um roteiro para explicar o projeto em uma entrevista tecnica.
+Ele cobre o problema, a arquitetura, o fluxo de dados, as decisoes de design,
+os trade-offs e perguntas que um entrevistador pode fazer.
 
-## Resumo executivo
+## 1. Resumo Curto
 
-O projeto e um microservico de logs para ambientes com multiplas aplicacoes. Ele recebe logs por HTTP, valida o contrato de entrada, desacopla a ingestao via fila, persiste os dados em PostgreSQL e oferece APIs de busca e estatisticas.
+O projeto e um microservico de logs estruturados. Ele recebe logs por uma API
+REST, valida o payload, registra um job de ingestao, publica esse job em uma
+fila Redis/BullMQ e usa um Worker para persistir os dados em PostgreSQL.
 
-A arquitetura principal e:
+A API tambem oferece busca, detalhe por ID, status do job de ingestao,
+estatisticas por severidade e health checks. O repositorio inclui Docker
+Compose, migrations, testes automatizados, CI e contrato OpenAPI.
+
+Arquitetura:
 
 ```text
-Cliente -> API REST Express -> BullMQ/Redis -> Worker -> PostgreSQL
+Client -> Express REST API -> BullMQ/Redis -> Worker -> PostgreSQL
 ```
 
-Eu optei por separar API e Worker para evitar que o tempo de escrita no banco e eventuais picos de carga afetem diretamente a latencia do cliente. A API responde `202 Accepted` quando o log foi aceito para processamento, e o status pode ser acompanhado por `GET /v1/logs/ingest/:jobId`.
+## 2. Pitch de 30 Segundos
 
-## Problema resolvido
+"Eu construi um pipeline de logs com API REST, fila e Worker. A API valida os
+logs com Zod, registra cada ingestao em uma tabela de jobs e publica no BullMQ.
+O Worker consome da fila com concorrencia, retry e backoff, grava no PostgreSQL
+e atualiza o status do job. Para consulta, a API tem filtros, full-text search
+simples, paginacao keyset e estatisticas por bucket de tempo. Tambem cuidei de
+migrations, Docker, health checks, CI, testes e documentacao OpenAPI."
 
-Em sistemas distribuidos, logs ficam espalhados em varios servicos. Este projeto centraliza a coleta e entrega tres capacidades principais:
+## 3. Problema Resolvido
 
-- Ingestao estruturada de logs.
-- Busca por filtros e texto.
-- Agregacoes para analise operacional.
+Em sistemas distribuidos, cada servico gera seus proprios logs. Sem um ponto
+central, investigar problemas exige acessar varios lugares diferentes. Este
+projeto centraliza os logs e entrega tres capacidades:
 
-O desenho favorece simplicidade operacional sem abrir mao de pontos importantes de producao: validacao de contrato, fila, migrations, health checks, CI, Docker e indices no banco.
+- Ingestao estruturada.
+- Processamento assincrono e rastreavel.
+- Busca e agregacao para analise operacional.
 
-## Componentes principais
+Exemplo de uso: uma aplicacao `billing-api` envia um log de pagamento aprovado.
+A API aceita o evento, devolve um `jobId`, o Worker grava o log no banco e o
+time pode buscar depois por `service`, `level`, mensagem ou intervalo de tempo.
 
-### API REST com Express
+## 4. Principais Requisitos Atendidos
 
-Arquivo: `src/api/server.js`
+- Receber logs via HTTP.
+- Validar contrato de entrada.
+- Aceitar log unico ou lote.
+- Evitar que a escrita no banco bloqueie a resposta do cliente.
+- Persistir logs estruturados em banco relacional.
+- Consultar logs por filtros.
+- Paginar sem `OFFSET`.
+- Agregar contagens por severidade e tempo.
+- Expor health checks para operacao.
+- Rodar localmente com Docker Compose.
+- Rodar testes em CI.
+- Documentar contrato via OpenAPI.
 
-A API registra:
+## 5. Arquitetura em Detalhes
 
-- `helmet` para headers de seguranca.
-- `cors` para permitir clientes externos.
-- `express-rate-limit` para reduzir abuso.
-- middleware opcional de API key via header `x-api-key`.
-- rotas de health, logs e stats.
-- shutdown gracioso para fechar HTTP, fila, pool PostgreSQL e Redis.
+### 5.1 API REST
 
-Express foi escolhido por ser simples, amplamente conhecido e facil de defender em entrevista como uma API REST tradicional. A complexidade principal do projeto fica no fluxo de ingestao assíncrona, nao no framework HTTP.
+Arquivo principal: `src/api/server.js`
 
-### Validacao com Zod
+A API usa Express e registra:
+
+- `helmet` para headers basicos de seguranca.
+- `cors` para permitir chamadas de clientes externos.
+- `express-rate-limit` para limitar abuso simples.
+- `express.json({ limit: "1mb" })` para controlar tamanho do body.
+- API key opcional via header `x-api-key`.
+- Rotas de health, logs e stats.
+- Handler central de erro.
+- Shutdown gracioso.
+
+O ponto importante para entrevista: Express aqui nao e o foco da arquitetura.
+Ele e uma escolha simples e conhecida para expor HTTP. A decisao mais importante
+e separar a API do processamento pesado usando fila e Worker.
+
+### 5.2 Validacao com Zod
 
 Arquivo: `src/shared/schemas.js`
 
-Os schemas Zod definem o contrato de entrada de ponta a ponta. A API valida payloads HTTP e o Worker valida novamente o payload recebido da fila. Essa dupla validacao e intencional: a fila e uma fronteira assíncrona e deve ser tratada como entrada externa.
+O projeto usa Zod para validar:
 
-Campos relevantes do log:
+- Payload de ingestao.
+- Query string de busca.
+- Query string de estatisticas.
+- Payload consumido pelo Worker.
 
-- `ts`: timestamp ISO com offset.
-- `service`: nome do servico emissor.
+Por que validar tambem no Worker?
+
+A fila e uma fronteira assincrona. Mesmo que hoje a unica produtora seja a API,
+em um sistema real outras fontes poderiam publicar jobs. O Worker nao deve
+confiar cegamente no conteudo da fila.
+
+Campos principais do log:
+
+- `ts`: timestamp ISO com timezone.
+- `service`: servico emissor.
 - `env`: ambiente, com default logico `prod`.
 - `level`: `trace`, `debug`, `info`, `warn`, `error` ou `fatal`.
-- `message`: mensagem textual.
+- `message`: texto pesquisavel.
 - `traceId` e `spanId`: correlacao distribuida.
-- `attrs`, `context` e `raw`: dados JSONB para flexibilidade.
+- `attrs`, `context` e `raw`: dados flexiveis em JSON.
 
-Tambem foi adicionada validacao para cursor keyset: `cursorTs` e `cursorId` precisam ser enviados juntos.
-
-### Fila BullMQ + Redis
+### 5.3 Fila com BullMQ e Redis
 
 Arquivo: `src/lib/queue.js`
 
-A fila foi configurada com:
+BullMQ fornece:
 
-- ate 5 tentativas por job.
-- backoff exponencial.
-- retencao limitada de jobs completos e falhos.
-- criacao lazy da fila para evitar conexoes Redis em testes que nao fazem ingestao real.
+- Publicacao de jobs.
+- Retry automatico.
+- Backoff exponencial.
+- Concorrencia no Worker.
+- Retencao limitada de jobs completos e falhos.
 
-Um detalhe importante: `QUEUE_NAME` nao pode conter `:` no BullMQ. O projeto agora usa `logs-ingest`.
+Configuracao atual:
 
-### Worker
+- `attempts: 5`
+- `backoff: exponential, delay 500ms`
+- `removeOnComplete: count 1000`
+- `removeOnFail: count 2000`
+
+Por que Redis/BullMQ?
+
+Para este escopo, BullMQ e simples de configurar, tem boa ergonomia em Node.js e
+resolve bem o caso de filas de background. Em uma escala maior, poderia ser
+substituido por Kafka, RabbitMQ, SQS ou outro broker, dependendo de requisitos
+de throughput, ordenacao, retencao e operacao.
+
+### 5.4 Worker
 
 Arquivo: `src/worker/worker.js`
 
-O Worker consome jobs da fila, valida o payload, insere o log no PostgreSQL e atualiza `ingest_jobs`.
+O Worker consome jobs da fila e executa o fluxo:
 
-Ciclo de status:
+1. Atualiza o job para `processing`.
+2. Valida o payload com Zod.
+3. Insere o log em `logs`.
+4. Atualiza o job para `processed`.
+5. Em erro definitivo, marca `failed` e salva a mensagem de erro.
 
-- `queued`: API registrou e enfileirou.
-- `processing`: Worker iniciou o processamento.
-- `processed`: log persistido com sucesso.
-- `failed`: erro definitivo apos tentativas ou payload invalido.
+O Worker usa concorrencia 10. Isso significa que ate 10 jobs podem ser
+processados em paralelo dentro do mesmo processo.
 
-O Worker tambem trata `SIGINT` e `SIGTERM`, o que e importante em Docker/Kubernetes porque o encerramento normal costuma vir por `SIGTERM`.
+O Worker tambem trata `SIGINT` e `SIGTERM`. Isso e importante em Docker e
+Kubernetes, porque o orquestrador envia sinal de encerramento antes de matar o
+processo. O shutdown gracioso reduz risco de interromper jobs no meio.
 
-## Modelo de dados
+### 5.5 PostgreSQL
 
-Arquivos: `migrations/001_init.sql` e `migrations/002_indexes.sql`
+Arquivos:
 
-Tabelas:
+- `migrations/001_init.sql`
+- `migrations/002_indexes.sql`
 
-- `logs`: armazena eventos.
-- `ingest_jobs`: rastreia o processamento assíncrono.
-- `schema_migrations`: registra migrations aplicadas.
+PostgreSQL foi escolhido por simplicidade operacional e flexibilidade:
 
-Indices:
+- Dados estruturados em colunas.
+- Campos flexiveis com JSONB.
+- Indices B-tree para filtros comuns.
+- Full-text search simples com GIN.
+- Agregacoes SQL para estatisticas.
 
-- `idx_logs_service_ts_desc`: otimiza buscas por servico ordenadas por tempo.
-- `idx_logs_level_ts_desc`: otimiza filtros por severidade.
-- `idx_logs_ts_desc`: otimiza listagem recente e paginacao keyset.
-- `idx_logs_message_fts`: habilita full-text search na mensagem.
-- `idx_logs_attrs_gin`: prepara consultas futuras em JSONB.
-- `idx_logs_trace_id`: acelera correlacao por trace.
+Para um projeto pequeno ou medio, PostgreSQL evita a complexidade de operar um
+Elasticsearch/OpenSearch sem necessidade imediata.
 
-## Busca e paginacao
+## 6. Fluxo de Ingestao
 
-Arquivo: `src/api/routes/logs.js`
+Endpoint:
 
-A busca usa SQL parametrizado, evitando interpolacao de valores do usuario. Os filtros sao adicionados dinamicamente, mas os valores sempre entram por placeholders `$1`, `$2`, etc.
+```text
+POST /v1/logs
+```
 
-A ordenacao e:
+Fluxo detalhado:
+
+1. Cliente envia um log ou um array de logs.
+2. API valida o body com `ingestBodySchema`.
+3. API normaliza alguns campos, como `env` e `raw`.
+4. API gera um `jobId` com `crypto.randomUUID()`.
+5. API insere uma linha em `ingest_jobs` com status `queued`.
+6. API publica o payload na fila BullMQ usando o mesmo `jobId`.
+7. API responde `202 Accepted`.
+8. Worker consome o job.
+9. Worker atualiza o status para `processing`.
+10. Worker valida o payload.
+11. Worker insere em `logs`.
+12. Worker atualiza o status para `processed`.
+
+Por que responder `202` e nao `201`?
+
+Porque a API ainda nao criou o recurso final `logs`. Ela aceitou o trabalho para
+processamento assincrono. O resultado final acontece depois, no Worker.
+
+Por que gravar `ingest_jobs` antes de publicar na fila?
+
+Isso permite rastrear a ingestao imediatamente. Se a publicacao na fila falhar,
+a API marca o job como `failed`, preservando uma pista operacional.
+
+## 7. Fluxo de Busca
+
+Endpoint:
+
+```text
+GET /v1/logs
+```
+
+Filtros:
+
+- `service`
+- `env`
+- `level`
+- `q`
+- `from`
+- `to`
+- `limit`
+- `cursorTs`
+- `cursorId`
+
+A query e montada dinamicamente, mas todos os valores entram como parametros
+SQL (`$1`, `$2`, etc.). Isso reduz risco de SQL injection.
+
+Ordenacao:
 
 ```sql
 ORDER BY ts DESC, id DESC
 ```
 
-A paginacao usa keyset:
+Paginacao:
 
 ```sql
 (ts, id) < ($cursorTs::timestamptz, $cursorId::bigint)
 ```
 
-Isso e melhor que `OFFSET` para datasets grandes, porque o banco nao precisa pular N linhas a cada pagina.
+Por que keyset pagination?
 
-## Estatisticas
+`OFFSET` fica mais caro conforme a pagina aumenta, porque o banco precisa pular
+linhas. Com keyset, a API usa o ultimo item da pagina anterior como ponto de
+continuidade. Isso e mais estavel para listas grandes e combina bem com indice
+em `(ts desc, id desc)`.
 
-Arquivo: `src/api/routes/stats.js`
+Por que usar `id` junto com `ts`?
 
-O endpoint `GET /v1/stats` retorna:
+Varios logs podem ter o mesmo timestamp. O `id` funciona como desempate
+deterministico e evita duplicar ou pular itens entre paginas.
 
-- contagem por `level`.
-- timeline por bucket de tempo e `level`.
+## 8. Busca Textual
 
-Foi corrigido um bug sutil: a query de timeline removia o ultimo filtro da clausula `WHERE`. Em cenarios com `service` e `env`, isso poderia misturar dados de ambientes ou servicos diferentes. A query agora aplica todos os filtros tanto em `byLevel` quanto em `timeline`.
+O filtro `q` usa:
 
-## DevOps e execucao
+```sql
+to_tsvector('simple', message) @@ plainto_tsquery('simple', $N)
+```
 
-### Docker
+E existe um indice:
 
-O `docker-compose.yml` agora sobe:
+```sql
+CREATE INDEX idx_logs_message_fts
+ON logs USING GIN (to_tsvector('simple', message));
+```
 
-- PostgreSQL com healthcheck.
-- Redis com healthcheck.
+Por que `simple`?
+
+O dicionario `simple` evita stemming especifico de idioma. E uma escolha neutra
+para logs, que muitas vezes tem termos tecnicos, codigos, nomes de servico e
+mensagens misturadas em ingles/portugues.
+
+Limite da decisao:
+
+PostgreSQL FTS e suficiente para esse escopo. Para ranking avancado, analise
+linguistica sofisticada, alto volume de busca ou retencao massiva, eu avaliaria
+OpenSearch/Elasticsearch.
+
+## 9. Estatisticas
+
+Endpoint:
+
+```text
+GET /v1/stats
+```
+
+Retorna:
+
+- `range`: intervalo considerado.
+- `byLevel`: contagem por severidade.
+- `timeline`: contagem por bucket de tempo e severidade.
+
+O bucket e calculado por:
+
+```sql
+to_timestamp(floor(extract(epoch from ts) / bucketSeconds) * bucketSeconds)
+```
+
+Isso agrupa eventos em janelas fixas. Com `bucketMinutes=60`, por exemplo, os
+logs sao agregados por hora.
+
+Observacao importante:
+
+`COUNT(*)::bigint` chega no Node.js como string pelo driver `pg`, para evitar
+perda de precisao em numeros grandes. Por isso o OpenAPI documenta `count` como
+string.
+
+## 10. Modelo de Dados
+
+### 10.1 Tabela `logs`
+
+Responsavel por armazenar o evento final.
+
+Campos principais:
+
+- `id`: identificador sequencial.
+- `ts`: timestamp do evento original.
+- `service`: servico emissor.
+- `env`: ambiente.
+- `level`: severidade.
+- `message`: mensagem principal.
+- `trace_id`: correlacao distribuida.
+- `span_id`: correlacao distribuida em nivel de span.
+- `attrs`: JSONB para atributos.
+- `context`: JSONB para contexto extra.
+- `raw`: JSONB com payload original ou equivalente.
+- `inserted_at`: momento em que o banco gravou o evento.
+
+### 10.2 Tabela `ingest_jobs`
+
+Responsavel por rastrear o processamento assincrono.
+
+Campos:
+
+- `job_id`
+- `received_at`
+- `processed_at`
+- `status`
+- `error`
+
+Estados:
+
+- `queued`: API aceitou e enfileirou.
+- `processing`: Worker iniciou.
+- `processed`: log persistido.
+- `failed`: processamento falhou definitivamente.
+
+### 10.3 Tabela `schema_migrations`
+
+Controla migrations ja aplicadas. O script `scripts/migrate.js` le arquivos
+`.sql` em ordem e registra cada migration aplicada.
+
+## 11. Indices
+
+Indices atuais:
+
+```sql
+CREATE INDEX idx_logs_service_ts_desc ON logs (service, ts DESC, id DESC);
+CREATE INDEX idx_logs_level_ts_desc ON logs (level, ts DESC, id DESC);
+CREATE INDEX idx_logs_ts_desc ON logs (ts DESC, id DESC);
+CREATE INDEX idx_logs_message_fts ON logs USING GIN (to_tsvector('simple', message));
+CREATE INDEX idx_logs_attrs_gin ON logs USING GIN (attrs);
+CREATE INDEX idx_logs_trace_id ON logs (trace_id) WHERE trace_id IS NOT NULL;
+```
+
+Como explicar:
+
+- `service + ts + id`: busca comum por servico e pagina recente.
+- `level + ts + id`: investigacao por severidade.
+- `ts + id`: listagem geral recente.
+- `message_fts`: busca textual.
+- `attrs_gin`: prepara filtros futuros por JSONB.
+- `trace_id`: acelera correlacao por trace sem indexar valores nulos.
+
+## 12. Erros e Resiliencia
+
+### Payload invalido
+
+A API retorna `400` com detalhes do Zod. Isso impede que dados ruins entrem na
+fila.
+
+### Falha ao publicar na fila
+
+A API marca o job como `failed` e responde erro. Isso evita deixar um job
+aparentemente `queued` quando ele nunca foi publicado.
+
+### Falha temporaria no Worker
+
+BullMQ tenta novamente ate 5 vezes com backoff exponencial.
+
+### Falha definitiva no Worker
+
+O job e marcado como `failed`, `processed_at` e preenchido e `error` guarda a
+mensagem.
+
+### Dependencias indisponiveis
+
+`GET /health/readiness` retorna `503` quando PostgreSQL ou Redis nao estao
+prontos. Isso e util para load balancers e orquestradores.
+
+## 13. Seguranca Basica
+
+Medidas no projeto:
+
+- API key opcional via `x-api-key`.
+- `helmet` para headers HTTP.
+- Rate limit basico.
+- Limite de body em `1mb`.
+- Validacao de schema.
+- Queries parametrizadas.
+
+O que eu melhoraria em producao:
+
+- Autenticacao com scopes por servico.
+- Rotacao de chaves.
+- Auditoria de acesso.
+- Rate limits por API key.
+- TLS terminando em proxy ou load balancer.
+- Separacao de permissoes de banco para API, Worker e migration.
+
+## 14. Docker e Operacao Local
+
+O `docker-compose.yml` sobe:
+
+- PostgreSQL.
+- Redis.
 - `migrate` como servico one-shot.
-- API, dependente de Postgres, Redis e migration concluida.
-- Worker, com as mesmas dependencias.
+- API.
+- Worker.
 
-Isso permite rodar o stack completo com:
+A API e o Worker dependem de:
 
-```bash
-docker compose up --build
+- Postgres saudavel.
+- Redis saudavel.
+- Migration concluida com sucesso.
+
+Isso evita iniciar a aplicacao antes do banco estar pronto ou antes do schema
+existir.
+
+## 15. Testes
+
+Ferramentas:
+
+- Vitest.
+- Supertest.
+
+Cobertura:
+
+- Liveness.
+- Validacao de payload invalido.
+- Validacao de query `limit`.
+- Rejeicao de cursor incompleto.
+- Garantia de que stats aplica filtros em `byLevel` e `timeline`.
+- Teste de integracao de ingestao real quando `RUN_INTEGRATION=1`.
+
+Por que alguns testes nao usam Redis/PostgreSQL real?
+
+Testes de contrato HTTP devem ser rapidos e deterministas. Redis/PostgreSQL real
+ficam para integracao, que o CI consegue rodar com services.
+
+## 16. CI
+
+O GitHub Actions:
+
+1. Sobe PostgreSQL.
+2. Sobe Redis.
+3. Instala dependencias com `npm ci`.
+4. Executa migrations.
+5. Roda a suite de testes com `RUN_INTEGRATION=1`.
+
+Isso valida nao so os handlers HTTP, mas tambem o caminho real de integracao
+quando as dependencias estao disponiveis.
+
+## 17. OpenAPI
+
+Arquivo:
+
+```text
+docs/openapi.yaml
 ```
 
-### Dockerfile
+O OpenAPI documenta:
 
-O Dockerfile passou a usar:
+- Health checks.
+- Ingestao individual e em lote.
+- Status de job.
+- Busca com filtros e cursor.
+- Detalhe por ID.
+- Estatisticas.
+- Schemas de erro.
+- API key opcional.
 
-```dockerfile
-COPY package*.json ./
-RUN npm ci --omit=dev
-```
+Por que OpenAPI estatico?
 
-`npm ci` deixa a instalacao mais reprodutivel em CI e em build de imagem, porque respeita exatamente o `package-lock.json`.
+Neste projeto, a prioridade e clareza e facilidade de revisao. Um YAML estatico
+evita dependencias extras no runtime e nao polui as rotas com comentarios
+grandes. Em um time maior, eu poderia gerar parte da documentacao a partir dos
+schemas ou publicar Swagger UI em ambiente interno.
 
-### CI
+## 18. Trade-offs
 
-O GitHub Actions tambem usa `npm ci`, roda migrations, depois executa a suite de testes com Postgres e Redis de servico.
+### PostgreSQL vs Elasticsearch
 
-## Testes
+PostgreSQL e mais simples para operar e suficiente para filtros, JSONB, FTS
+basico e agregacoes. Elasticsearch faria sentido com busca textual pesada,
+ranking avancado, volume muito alto ou necessidade de features especificas de
+observabilidade.
 
-Ferramenta: Vitest.
+### BullMQ vs Kafka
 
-Cobertura atual:
+BullMQ e simples e bom para background jobs. Kafka e melhor para streaming de
+alto throughput, retencao longa, multiplos consumidores independentes e replay.
+Para o escopo do projeto, BullMQ entrega valor sem complexidade extra.
 
-- liveness da API.
-- validacao de payload invalido na ingestao.
-- validacao de `limit` na busca.
-- rejeicao de cursor incompleto.
-- garantia de que stats aplica `service` e `env` tambem na timeline.
+### 202 Accepted vs escrita sincrona
 
-Os testes unitarios usam Vitest com Supertest para validar o contrato HTTP sem abrir um servidor real. Eles tambem evitam conexao Redis desnecessaria porque a fila e criada sob demanda. O teste de ingestao real fica protegido por `RUN_INTEGRATION=1`, pois depende de Redis/PostgreSQL.
+Responder `202` reduz latencia e desacopla falhas temporarias do banco. O custo
+e consistencia eventual: o cliente precisa consultar o status se quiser saber se
+o log foi persistido.
 
-## Melhorias realizadas
+### JSONB vs schema totalmente rigido
 
-- Corrigi `QUEUE_NAME` invalido para BullMQ.
-- Ajustei `.env.example` para nao ativar API key por acidente.
-- Troquei `uuid` externo por `crypto.randomUUID()` nativo do Node.
-- Padronizei a camada HTTP em Express REST sem alterar o contrato publico.
-- Tornei a fila lazy para nao abrir Redis em testes sem ingestao real.
-- Corrigi bug de filtros no endpoint de stats.
-- Adicionei validacao para cursor keyset incompleto.
-- Melhorei readiness para retornar HTTP 503 quando dependencias falham.
-- Adicionei shutdown gracioso na API e no Worker.
-- Atualizei Docker Compose para rodar migrations antes de API/Worker.
-- Atualizei Dockerfile e CI para `npm ci`.
-- Reescrevi README e GUIDE para refletirem o projeto real.
-- Adicionei testes para os bugs corrigidos.
+Campos estruturados atendem filtros principais. JSONB permite evoluir atributos
+sem migration a cada novo campo. O trade-off e que consultas JSONB precisam ser
+planejadas e indexadas com cuidado.
 
-## Trade-offs
+### Migration runner simples
 
-### PostgreSQL em vez de Elasticsearch
+O runner atual e suficiente para um projeto pequeno. Em producao, eu avaliaria
+locks, rollback, dry-run, observabilidade e ferramentas maduras de migration.
 
-Para um projeto pequeno ou medio, PostgreSQL com FTS e JSONB entrega bom custo-beneficio e menos complexidade operacional. Elasticsearch seria considerado se a escala de busca textual, retencao ou analytics exigisse um motor especializado.
+## 19. Limitacoes Conhecidas
 
-### Resposta 202 na ingestao
+- Nao ha retencao ou particionamento por tempo.
+- Nao ha endpoint Prometheus.
+- Nao ha dead-letter queue explicita.
+- Nao ha busca por `attrs` exposta na API, apesar do indice GIN.
+- Autenticacao e propositalmente simples.
+- OpenAPI e mantido manualmente.
 
-A API nao garante que o log ja foi persistido quando responde. Ela garante que o log foi validado e aceito para processamento. Esse trade-off melhora resiliencia e latencia, mas exige status de job para rastreabilidade.
+## 20. Melhorias Futuras
 
-### Contagens como bigint
+Prioridade alta:
 
-O PostgreSQL retorna `COUNT(*)::bigint`. O driver `pg` representa bigint como string para evitar perda de precisao em JavaScript. Eu manteria isso em APIs de observabilidade, onde contagens podem crescer bastante.
-
-### Runner de migrations simples
-
-O runner atual e suficiente para o escopo do projeto. Em producao maior, eu avaliaria ferramentas com rollback, locks distribuidos, dry-run e melhor observabilidade.
-
-## O que eu faria depois
-
-- Filtros por `traceId`, `spanId` e campos especificos de `attrs`.
-- Retencao/particionamento por tempo em PostgreSQL.
+- Filtros por `traceId`, `spanId` e campos de `attrs`.
 - Endpoint de metricas Prometheus.
-- Autenticacao mais completa, com scopes por servico.
-- Dead-letter queue explicita para jobs falhos.
-- Observabilidade do Worker: throughput, latencia de processamento e numero de retries.
-- Testes end-to-end com Compose ou Testcontainers.
-- OpenAPI/Swagger para documentar contratos HTTP.
+- Dead-letter queue explicita.
+- Testes end-to-end com Testcontainers ou Compose automatizado.
 
-## Pitch para entrevista
+Prioridade media:
 
-"Eu construiria esse projeto como um pipeline de logs simples, mas com preocupacoes reais de producao. A API REST com Express cuida de validacao, autenticacao opcional e resposta rapida. A fila BullMQ desacopla o caminho critico, permitindo retry e backoff. O Worker e responsavel pela persistencia e pelo ciclo de status do job. No banco, usei PostgreSQL com JSONB, FTS e indices alinhados aos filtros principais. Para busca, preferi keyset pagination em vez de OFFSET para manter performance em volume. Tambem cuidei de health checks, migrations, Docker, CI e shutdown gracioso. O resultado e pequeno o suficiente para ser entendido rapido, mas ja tem varias decisoes que eu esperaria em um servico real."
+- Particionamento mensal ou diario em `logs`.
+- Politica de retencao por ambiente.
+- Scopes por API key.
+- Dashboard simples de jobs falhos.
+
+Prioridade baixa:
+
+- Swagger UI servido pela propria API.
+- Geracao parcial de OpenAPI a partir dos schemas Zod.
+- Exportacao para outro backend analitico.
+
+## 21. Perguntas Provaveis de Entrevista
+
+### Por que existe API e Worker separados?
+
+Para desacoplar a latencia do cliente da escrita no banco. A API valida e aceita
+o trabalho rapidamente; o Worker lida com persistencia, retries e falhas.
+
+### O que acontece se o Worker cair?
+
+Os jobs continuam na fila. Quando o Worker voltar, ele pode continuar
+processando. Se uma tentativa falhar, BullMQ aplica retry conforme configurado.
+
+### O que acontece se o Redis cair?
+
+A API nao consegue publicar novos jobs e deve retornar erro. O readiness tambem
+falha. Em producao, isso indicaria que a instancia nao deve receber trafego.
+
+### O que acontece se o PostgreSQL cair?
+
+A API nao consegue registrar `ingest_jobs` nem buscar logs. O Worker tambem nao
+consegue persistir. O readiness retorna `503`.
+
+### Existe risco de perder log?
+
+O projeto reduz risco ao registrar o job e usar fila com retry. Ainda assim,
+sem garantias transacionais entre PostgreSQL e Redis, existe um trade-off:
+registrar job e publicar em fila sao duas operacoes diferentes. Para evoluir, eu
+poderia usar outbox pattern: gravar evento em uma tabela outbox na mesma
+transacao e ter um publisher separado.
+
+### Por que nao usar uma transacao envolvendo fila e banco?
+
+Redis/BullMQ e PostgreSQL nao participam de uma transacao distribuida simples.
+Em sistemas reais, eu evitaria two-phase commit e preferiria outbox pattern ou
+idempotencia forte.
+
+### A ingestao e idempotente?
+
+Parcialmente. Cada request gera novos `jobIds`. O Worker nao deduplica logs por
+conteudo. Para idempotencia real, eu adicionaria um `dedupeKey` opcional vindo
+do cliente e uma constraint unica.
+
+### Como escalar?
+
+- Escalar API horizontalmente.
+- Escalar Workers horizontalmente.
+- Ajustar concorrencia do Worker.
+- Monitorar tamanho da fila e latencia de processamento.
+- Particionar `logs` por tempo.
+- Avaliar backend especializado para busca em alto volume.
+
+### Como observar esse servico?
+
+Hoje existem logs estruturados e health checks. Eu adicionaria:
+
+- Metricas Prometheus.
+- Tamanho da fila.
+- Jobs processados por segundo.
+- Latencia de processamento.
+- Contagem de retries e falhas.
+- Tempo de queries.
+
+### Como proteger multi-tenant?
+
+Eu adicionaria tenant/service ownership, API keys com scopes, filtros obrigatorios
+por tenant e talvez particionamento logico ou fisico dependendo do isolamento
+necessario.
+
+## 22. Roteiro de Explicacao de 5 Minutos
+
+1. Comece pelo problema: centralizar logs de varios servicos.
+2. Mostre a arquitetura: API, fila, Worker, PostgreSQL.
+3. Explique ingestao: validacao, job, fila, `202 Accepted`, Worker.
+4. Explique busca: filtros parametrizados, FTS, keyset pagination.
+5. Explique stats: contagem por level e timeline.
+6. Explique operacao: Docker, migrations, health checks e CI.
+7. Feche com trade-offs: PostgreSQL vs Elasticsearch, BullMQ vs Kafka,
+   consistencia eventual e proximas melhorias.
+
+## 23. Frase Final
+
+"O projeto e pequeno o bastante para ser entendido rapido, mas inclui decisoes
+que aparecem em sistemas reais: contratos bem definidos, fila, processamento
+assincrono, persistencia estruturada, busca paginada, health checks, migrations,
+CI, Docker e documentacao OpenAPI. Eu consigo defender tanto a implementacao
+quanto os trade-offs."
