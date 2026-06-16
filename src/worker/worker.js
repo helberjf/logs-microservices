@@ -121,10 +121,12 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
-process.on("SIGINT", () => {
-  void shutdown("SIGINT");
-});
+if (process.env.VITEST !== "true") {
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
 
-process.on("SIGTERM", () => {
-  void shutdown("SIGTERM");
-});
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+}
