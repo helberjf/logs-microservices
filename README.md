@@ -1,14 +1,12 @@
 # Logs Microservice
 
-Microservico para ingestao, processamento assincrono, armazenamento, busca e
-agregacao de logs estruturados.
+[![CI](https://github.com/helberjf/logs-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/helberjf/logs-microservices/actions/workflows/ci.yml)
 
-O projeto simula uma plataforma pequena de observabilidade: varias aplicacoes
-enviam logs por HTTP, a API valida e enfileira os eventos, um Worker persiste os
-dados em PostgreSQL e a API oferece endpoints para busca, detalhe, status de
-ingestao e estatisticas.
+A backend microservice for **ingesting, asynchronously processing, storing, searching and aggregating structured logs**.
 
-## Visao Geral
+The project models a small observability platform: multiple applications ship logs over HTTP, the API validates and enqueues the events, a Worker persists them to PostgreSQL, and the API exposes endpoints for search, detail lookup, ingestion status and statistics.
+
+## Overview
 
 ```text
 Client
@@ -16,23 +14,22 @@ Client
   v
 Express REST API
   |
-  | cria ingest_jobs + publica job
+  | creates ingest_jobs + publishes a job
   v
 BullMQ / Redis
   |
-  | Worker consome com retry/backoff
+  | Worker consumes with retry/backoff
   v
 PostgreSQL
 ```
 
-Por que essa arquitetura?
+Why this architecture?
 
-- A API responde rapido com `202 Accepted` depois de validar e enfileirar.
-- A escrita no banco fica desacoplada da latencia do cliente.
-- Redis/BullMQ entrega fila, retry, backoff e concorrencia do Worker.
-- PostgreSQL guarda logs estruturados, JSONB, busca textual simples e agregacoes.
-- Health checks, migrations, Docker e CI deixam o projeto mais proximo de um
-  servico real.
+- The API responds fast with `202 Accepted` after validating and enqueuing.
+- Database writes are decoupled from client latency.
+- Redis/BullMQ provide the queue, retries, backoff and Worker concurrency.
+- PostgreSQL stores the structured logs, JSONB, simple full-text search and aggregations.
+- Health checks, migrations, Docker and CI bring the project closer to a real service.
 
 ## Stack
 
@@ -47,37 +44,34 @@ Por que essa arquitetura?
 - Docker Compose
 - GitHub Actions
 
-## Recursos
+## Features
 
-- API REST com validacao de contratos.
-- Ingestao individual ou em lote, com limite de 500 logs por request.
-- Idempotencia opcional com `dedupeKey`.
-- Processamento assincrono via fila.
-- Status de ingestao: `queued`, `processing`, `processed`, `failed`.
-- Busca por `service`, `env`, `level`, `traceId`, `spanId`, atributos JSON,
-  texto, intervalo de tempo e cursor.
-- Paginacao keyset com `cursorTs` e `cursorId`.
-- Estatisticas por level e timeline por bucket de tempo.
-- Health checks de liveness e readiness.
-- Metricas Prometheus em `GET /metrics`.
-- Dead-letter tracking em PostgreSQL para falhas definitivas do Worker.
-- Script de retencao por tempo com `npm run retention`.
-- Smoke test E2E para o stack Docker com `npm run test:e2e`.
-- OpenAPI/Swagger em `docs/openapi.yaml`.
-- Documentacao tecnica para entrevista em `ENTREVISTA_TECNICA.md`.
+- REST API with contract validation.
+- Single or batch ingestion, with a limit of 500 logs per request.
+- Optional idempotency via `dedupeKey`.
+- Asynchronous processing through a queue.
+- Ingestion status: `queued`, `processing`, `processed`, `failed`.
+- Search by `service`, `env`, `level`, `traceId`, `spanId`, JSON attributes, free text, time range and cursor.
+- Keyset pagination with `cursorTs` and `cursorId`.
+- Statistics per level and a timeline grouped by time bucket.
+- Liveness and readiness health checks.
+- Prometheus metrics at `GET /metrics`.
+- Dead-letter tracking in PostgreSQL for the Worker's permanent failures.
+- Time-based retention script via `npm run retention`.
+- E2E smoke test for the Docker stack via `npm run test:e2e`.
+- OpenAPI/Swagger spec in `docs/openapi.yaml`.
 
-## Documentacao da API
+## API documentation
 
-A especificacao OpenAPI esta em:
+The OpenAPI specification lives in:
 
 ```text
 docs/openapi.yaml
 ```
 
-Voce pode abrir esse arquivo no Swagger Editor, Insomnia, Postman ou qualquer
-ferramenta compativel com OpenAPI 3.0.
+You can open it in Swagger Editor, Insomnia, Postman or any tool compatible with OpenAPI 3.0.
 
-Endpoints documentados:
+Documented endpoints:
 
 - `GET /health/liveness`
 - `GET /health/readiness`
@@ -88,74 +82,74 @@ Endpoints documentados:
 - `GET /v1/logs/{id}`
 - `GET /v1/stats`
 
-## Configuracao
+## Configuration
 
-Copie o arquivo de exemplo:
+Copy the example file:
 
 ```bash
 cp .env.example .env
 ```
 
-Variaveis:
+Variables:
 
-| Variavel | Exemplo | Descricao |
+| Variable | Example | Description |
 | --- | --- | --- |
-| `PORT` | `3000` | Porta HTTP da API |
-| `NODE_ENV` | `development` | Ambiente da aplicacao |
-| `API_KEY` | vazio | Opcional; quando preenchida exige header `x-api-key` |
-| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/logs?sslmode=disable` | Conexao PostgreSQL |
-| `REDIS_URL` | `redis://localhost:6379` | Conexao Redis |
-| `QUEUE_NAME` | `logs-ingest` | Nome da fila BullMQ; evite `:` no nome |
-| `RETENTION_DAYS` | `30` | Janela de retencao usada por `npm run retention` |
-| `RETENTION_BATCH_SIZE` | `1000` | Tamanho de lote para limpeza de logs antigos |
+| `PORT` | `3000` | HTTP port of the API |
+| `NODE_ENV` | `development` | Application environment |
+| `API_KEY` | empty | Optional; when set, requires the `x-api-key` header |
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/logs?sslmode=disable` | PostgreSQL connection |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection |
+| `QUEUE_NAME` | `logs-ingest` | BullMQ queue name; avoid `:` in the name |
+| `RETENTION_DAYS` | `30` | Retention window used by `npm run retention` |
+| `RETENTION_BATCH_SIZE` | `1000` | Batch size for cleaning up old logs |
 
-## Rodando com Docker Compose
+## Running with Docker Compose
 
-Para subir Postgres, Redis, migrations, API e Worker:
+To start Postgres, Redis, migrations, the API and the Worker:
 
 ```bash
 docker compose up --build
 ```
 
-O Compose executa o servico `migrate` antes de iniciar API e Worker.
+Compose runs the `migrate` service before starting the API and the Worker.
 
-Teste a API:
+Test the API:
 
 ```bash
 curl http://localhost:3000/health/liveness
 curl http://localhost:3000/health/readiness
 ```
 
-## Rodando em Desenvolvimento
+## Running in development
 
-Instale as dependencias:
+Install dependencies:
 
 ```bash
 npm install
 ```
 
-Suba Postgres e Redis:
+Start Postgres and Redis:
 
 ```bash
 docker compose up -d postgres redis
 ```
 
-Rode as migrations:
+Run the migrations:
 
 ```bash
 npm run migrate
 ```
 
-Inicie API e Worker em terminais separados:
+Start the API and the Worker in separate terminals:
 
 ```bash
 npm run dev:api
 npm run dev:worker
 ```
 
-## Exemplos de Uso
+## Usage examples
 
-### Ingerir Um Log
+### Ingest a log
 
 ```bash
 curl -X POST http://localhost:3000/v1/logs \
@@ -176,7 +170,7 @@ curl -X POST http://localhost:3000/v1/logs \
   }'
 ```
 
-Resposta:
+Response:
 
 ```json
 {
@@ -185,8 +179,7 @@ Resposta:
 }
 ```
 
-Se o mesmo `dedupeKey` for enviado novamente, a API retorna o `jobId`
-existente e nao publica um segundo job na fila:
+If the same `dedupeKey` is sent again, the API returns the existing `jobId` and does not publish a second job to the queue:
 
 ```json
 {
@@ -196,13 +189,13 @@ existente e nao publica um segundo job na fila:
 }
 ```
 
-### Consultar Status do Job
+### Check the job status
 
 ```bash
 curl http://localhost:3000/v1/logs/ingest/4df7e9c5-d52f-41f8-bdd2-61c9163f8d55
 ```
 
-Resposta esperada depois do Worker processar:
+Expected response after the Worker processes the job:
 
 ```json
 {
@@ -214,13 +207,13 @@ Resposta esperada depois do Worker processar:
 }
 ```
 
-### Buscar Logs
+### Search logs
 
 ```bash
 curl "http://localhost:3000/v1/logs?service=billing-api&level=info&q=payment&limit=50"
 ```
 
-Filtros adicionais de observabilidade:
+Additional observability filters:
 
 ```bash
 curl "http://localhost:3000/v1/logs?traceId=trace-123&spanId=span-456"
@@ -228,72 +221,69 @@ curl "http://localhost:3000/v1/logs?attrKey=orderId&attrValue=A1"
 curl "http://localhost:3000/v1/logs?attrKey=orderId"
 ```
 
-A resposta inclui `nextCursor` quando existe uma proxima pagina. Para continuar,
-envie `cursorTs` e `cursorId` juntos:
+The response includes `nextCursor` when there is a next page. To continue, send `cursorTs` and `cursorId` together:
 
 ```bash
 curl "http://localhost:3000/v1/logs?service=billing-api&limit=50&cursorTs=2026-03-02T10:00:00.000Z&cursorId=123"
 ```
 
-### Estatisticas
+### Statistics
 
 ```bash
 curl "http://localhost:3000/v1/stats?bucketMinutes=60&service=billing-api&env=prod"
 ```
 
-Retorna:
+Returns:
 
-- `byLevel`: contagem por severidade.
-- `timeline`: contagem por bucket de tempo e severidade.
+- `byLevel`: count per severity.
+- `timeline`: count per time bucket and severity.
 
-### Metricas
+### Metrics
 
 ```bash
 curl http://localhost:3000/metrics
 ```
 
-O endpoint usa formato de texto Prometheus e inclui:
+The endpoint uses the Prometheus text format and includes:
 
-- uptime do processo;
-- requests HTTP por metodo, rota e status;
-- logs aceitos/falhas de enqueue;
-- contagem de jobs BullMQ por estado quando Redis esta disponivel, incluindo
-  `completed` e `failed`.
+- process uptime;
+- HTTP requests by method, route and status;
+- accepted logs / enqueue failures;
+- BullMQ job counts by state when Redis is available, including `completed` and `failed`.
 
-### Retencao
+### Retention
 
-Para limpar logs antigos de acordo com `RETENTION_DAYS`:
+To purge old logs according to `RETENTION_DAYS`:
 
 ```bash
 npm run retention
 ```
 
-O script remove em lotes (`RETENTION_BATCH_SIZE`) para evitar deletar uma tabela
-grande em uma unica operacao.
+The script deletes in batches (`RETENTION_BATCH_SIZE`) to avoid wiping a large table in a single operation.
 
-## Modelo de Dados
+## Data model
 
-As migrations ficam em `migrations/`.
+Migrations live in `migrations/`.
 
-Tabelas:
+Tables:
 
-- `logs`: eventos persistidos, com campos estruturados e colunas JSONB.
-- `ingest_jobs`: rastreia o ciclo de vida dos jobs assincronos.
-- `ingest_dead_letters`: guarda jobs que falharam definitivamente no Worker.
-- `schema_migrations`: registra migrations aplicadas.
+- `logs`: persisted events, with structured fields and JSONB columns.
+- `ingest_jobs`: tracks the lifecycle of the asynchronous jobs.
+- `ingest_dead_letters`: stores jobs that failed permanently in the Worker.
+- `schema_migrations`: records the applied migrations.
 
-Indices principais:
+Key indexes:
 
-- `(service, ts desc, id desc)` para busca por servico.
-- `(level, ts desc, id desc)` para busca por severidade.
-- `(ts desc, id desc)` para listagem recente e paginacao keyset.
-- GIN em `to_tsvector('simple', message)` para busca textual.
-- GIN em `attrs` para evolucao futura de filtros por JSONB.
-- Indice parcial em `trace_id` para correlacao distribuida.
-- Indice parcial em `span_id` para correlacao por span.
-- Indice unico parcial em `ingest_jobs.dedupe_key` para idempotencia.
+- `(service, ts desc, id desc)` for search by service.
+- `(level, ts desc, id desc)` for search by severity.
+- `(ts desc, id desc)` for recent listing and keyset pagination.
+- GIN on `to_tsvector('simple', message)` for full-text search.
+- GIN on `attrs` for future JSONB filtering.
+- Partial index on `trace_id` for distributed correlation.
+- Partial index on `span_id` for span-level correlation.
+- Partial unique index on `ingest_jobs.dedupe_key` for idempotency.
 
-## Testes e Qualidade
+## Tests and quality
 
 ```bash
 npm test
@@ -301,16 +291,11 @@ npm run lint
 npm run test:e2e
 ```
 
-Os testes HTTP usam Vitest e Supertest. Eles validam contratos sem abrir um
-servidor real. O teste de integracao completa fica protegido por
-`RUN_INTEGRATION=1`, pois depende de PostgreSQL e Redis.
+The HTTP tests use Vitest and Supertest. They validate contracts without opening a real server. The full integration test is gated behind `RUN_INTEGRATION=1`, since it depends on PostgreSQL and Redis.
 
-O smoke E2E (`npm run test:e2e`) espera o stack completo rodando em
-`http://localhost:3000`, por exemplo via `docker compose up --build`. No CI, o
-GitHub Actions roda lint, sobe PostgreSQL e Redis, roda as migrations e executa
-a suite de testes.
+The E2E smoke test (`npm run test:e2e`) expects the full stack running on `http://localhost:3000`, e.g. via `docker compose up --build`. In CI, GitHub Actions runs lint, brings up PostgreSQL and Redis, runs the migrations and executes the test suite.
 
-## Estrutura
+## Project structure
 
 ```text
 src/
@@ -340,18 +325,12 @@ scripts/
 test/
 ```
 
-## Como Explicar em Entrevista
+## How to explain it in an interview
 
-Um bom resumo:
+A good summary:
 
-> "Eu construi um pipeline de logs com API REST, fila e Worker. A API valida o
-> payload com Zod, registra um job no PostgreSQL e publica no BullMQ. O Worker
-> consome da fila com retry/backoff, persiste o log e atualiza o status. A API
-> tem idempotencia por dedupeKey, dead-letter tracking, metricas Prometheus,
-> retencao por tempo e busca com filtros SQL parametrizados, full-text search
-> simples e paginacao keyset. Tambem inclui migrations, Docker Compose, CI,
-> testes e contrato OpenAPI."
+> "I built a log pipeline with a REST API, a queue and a Worker. The API validates the payload with Zod, records a job in PostgreSQL and publishes it to BullMQ. The Worker consumes from the queue with retry/backoff, persists the log and updates the status. The API has idempotency via dedupeKey, dead-letter tracking, Prometheus metrics, time-based retention and search with parameterized SQL filters, simple full-text search and keyset pagination. It also includes migrations, Docker Compose, CI, tests and an OpenAPI contract."
 
-Para uma explicacao detalhada, leia:
+## License
 
-- `ENTREVISTA_TECNICA.md`
+MIT
