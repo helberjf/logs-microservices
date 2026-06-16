@@ -17,6 +17,7 @@ export const ingestLogSchema = z.object({
   message: z.string().min(1).max(20000),
   traceId: z.string().max(128).optional(),
   spanId: z.string().max(128).optional(),
+  dedupeKey: z.string().min(1).max(180).optional(),
   attrs: z.record(z.string(), z.any()).optional(),
   context: z.record(z.string(), z.any()).optional(),
   raw: z.any().optional(),
@@ -32,6 +33,10 @@ export const searchQuerySchema = z
     service: z.string().min(1).max(120).optional(),
     env: z.string().min(1).max(40).optional(),
     level: logLevelEnum.optional(),
+    traceId: z.string().min(1).max(128).optional(),
+    spanId: z.string().min(1).max(128).optional(),
+    attrKey: z.string().min(1).max(120).optional(),
+    attrValue: z.string().min(1).max(500).optional(),
     q: z.string().min(1).max(200).optional(),
     from: z.string().datetime({ offset: true }).optional(),
     to: z.string().datetime({ offset: true }).optional(),
@@ -42,6 +47,10 @@ export const searchQuerySchema = z
   .refine((q) => Boolean(q.cursorTs) === Boolean(q.cursorId), {
     message: "cursorTs and cursorId must be provided together",
     path: ["cursor"],
+  })
+  .refine((q) => !q.attrValue || Boolean(q.attrKey), {
+    message: "attrKey must be provided when attrValue is used",
+    path: ["attrKey"],
   });
 
 export const statsQuerySchema = z.object({

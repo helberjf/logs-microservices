@@ -4,8 +4,54 @@ import { ingestBodySchema, searchQuerySchema } from "../../shared/schemas.js";
 import { getIngestQueue } from "../../lib/queue.js";
 import { pool } from "../../lib/db.js";
 import { logger } from "../../lib/logger.js";
+import {
+  incrementIngestAccepted,
+  incrementIngestFailed,
+} from "../../lib/metrics.js";
 
 export const logsRouter = Router();
+
+function parseAttributeValue(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+async function registerIngestJob(jobId, dedupeKey) {
+  if (!dedupeKey) {
+    await pool.query(
+      "INSERT INTO ingest_jobs (job_id, status) VALUES ($1, 'queued') ON CONFLICT (job_id) DO NOTHING",
+      [jobId],
+    );
+    return { jobId, duplicate: false };
+  }
+
+  const inserted = await pool.query(
+    `
+    INSERT INTO ingest_jobs (job_id, dedupe_key, status)
+    VALUES ($1, $2, 'queued')
+    ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+    RETURNING job_id
+    `,
+    [jobId, dedupeKey],
+  );
+
+  if (inserted.rowCount > 0) {
+    return { jobId: inserted.rows[0].job_id, duplicate: false };
+  }
+
+  const existing = await pool.query(
+    "SELECT job_id FROM ingest_jobs WHERE dedupe_key = $1",
+    [dedupeKey],
+  );
+  if (existing.rowCount === 0) {
+    throw new Error(`dedupeKey conflict without existing job: ${dedupeKey}`);
+  }
+
+  return { jobId: existing.rows[0].job_id, duplicate: true };
+}
 
 logsRouter.post("/", async (req, res) => {
   const parsed = ingestBodySchema.safeParse(req.body);
@@ -29,33 +75,45 @@ logsRouter.post("/", async (req, res) => {
         message: l.message,
         traceId: l.traceId,
         spanId: l.spanId,
+        dedupeKey: l.dedupeKey,
         attrs: l.attrs ?? {},
         context: l.context ?? {},
         raw: l.raw ?? l,
       };
 
-      await pool.query(
-        "INSERT INTO ingest_jobs (job_id, status) VALUES ($1, 'queued') ON CONFLICT (job_id) DO NOTHING",
-        [jobId],
-      );
+      const registered = await registerIngestJob(jobId, l.dedupeKey);
+      if (registered.duplicate) return registered;
 
       try {
-        await getIngestQueue().add("ingest", payload, { jobId });
+        await getIngestQueue().add("ingest", payload, {
+          jobId: registered.jobId,
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         await pool.query(
           "UPDATE ingest_jobs SET status = 'failed', processed_at = now(), error = $2 WHERE job_id = $1",
-          [jobId, message],
+          [registered.jobId, message],
         );
         throw err;
       }
 
-      return jobId;
+      return registered;
     });
 
-    const jobIds = await Promise.all(ops);
-    return res.status(202).json({ accepted: jobIds.length, jobIds });
+    const results = await Promise.all(ops);
+    const jobIds = results.map((result) => result.jobId);
+    const duplicates = results.filter((result) => result.duplicate).length;
+    incrementIngestAccepted(jobIds.length - duplicates);
+
+    return res
+      .status(202)
+      .json({
+        accepted: jobIds.length,
+        jobIds,
+        ...(duplicates ? { duplicates } : {}),
+      });
   } catch (err) {
+    incrementIngestFailed();
     logger.error({ err }, "failed to enqueue ingest job(s)");
     return res.status(500).json({ error: "internal_error" });
   }
@@ -98,6 +156,23 @@ logsRouter.get("/", async (req, res, next) => {
   if (q.level) {
     params.push(q.level);
     where.push(`level = $${params.length}`);
+  }
+  if (q.traceId) {
+    params.push(q.traceId);
+    where.push(`trace_id = $${params.length}`);
+  }
+  if (q.spanId) {
+    params.push(q.spanId);
+    where.push(`span_id = $${params.length}`);
+  }
+  if (q.attrKey && q.attrValue) {
+    params.push(
+      JSON.stringify({ [q.attrKey]: parseAttributeValue(q.attrValue) }),
+    );
+    where.push(`attrs @> $${params.length}::jsonb`);
+  } else if (q.attrKey) {
+    params.push(q.attrKey);
+    where.push(`attrs ? $${params.length}`);
   }
   if (q.from) {
     params.push(q.from);

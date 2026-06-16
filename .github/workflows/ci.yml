@@ -40,6 +40,8 @@ jobs:
           node-version: 20
           cache: "npm"
       - run: npm ci
+      - name: Run lint
+        run: npm run lint
       - name: Run migrations
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/logs

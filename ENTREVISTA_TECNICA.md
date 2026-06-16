@@ -11,8 +11,8 @@ REST, valida o payload, registra um job de ingestao, publica esse job em uma
 fila Redis/BullMQ e usa um Worker para persistir os dados em PostgreSQL.
 
 A API tambem oferece busca, detalhe por ID, status do job de ingestao,
-estatisticas por severidade e health checks. O repositorio inclui Docker
-Compose, migrations, testes automatizados, CI e contrato OpenAPI.
+estatisticas por severidade, metricas Prometheus e health checks. O repositorio
+inclui Docker Compose, migrations, testes automatizados, CI e contrato OpenAPI.
 
 Arquitetura:
 
@@ -25,9 +25,11 @@ Client -> Express REST API -> BullMQ/Redis -> Worker -> PostgreSQL
 "Eu construi um pipeline de logs com API REST, fila e Worker. A API valida os
 logs com Zod, registra cada ingestao em uma tabela de jobs e publica no BullMQ.
 O Worker consome da fila com concorrencia, retry e backoff, grava no PostgreSQL
-e atualiza o status do job. Para consulta, a API tem filtros, full-text search
-simples, paginacao keyset e estatisticas por bucket de tempo. Tambem cuidei de
-migrations, Docker, health checks, CI, testes e documentacao OpenAPI."
+e atualiza o status do job. Para consulta, a API tem filtros por servico, trace,
+span, atributos JSON, full-text search simples, paginacao keyset e estatisticas
+por bucket de tempo. Tambem inclui idempotencia por `dedupeKey`, dead-letter
+tracking, retencao por tempo, metricas, Docker, CI, testes e documentacao
+OpenAPI."
 
 ## 3. Problema Resolvido
 
@@ -54,6 +56,10 @@ time pode buscar depois por `service`, `level`, mensagem ou intervalo de tempo.
 - Paginar sem `OFFSET`.
 - Agregar contagens por severidade e tempo.
 - Expor health checks para operacao.
+- Expor metricas Prometheus.
+- Evitar duplicidade com `dedupeKey`.
+- Registrar falhas definitivas em dead-letter table.
+- Limpar logs antigos por politica de retencao.
 - Rodar localmente com Docker Compose.
 - Rodar testes em CI.
 - Documentar contrato via OpenAPI.
@@ -104,6 +110,7 @@ Campos principais do log:
 - `level`: `trace`, `debug`, `info`, `warn`, `error` ou `fatal`.
 - `message`: texto pesquisavel.
 - `traceId` e `spanId`: correlacao distribuida.
+- `dedupeKey`: chave opcional de idempotencia.
 - `attrs`, `context` e `raw`: dados flexiveis em JSON.
 
 ### 5.3 Fila com BullMQ e Redis
@@ -184,6 +191,7 @@ Fluxo detalhado:
 3. API normaliza alguns campos, como `env` e `raw`.
 4. API gera um `jobId` com `crypto.randomUUID()`.
 5. API insere uma linha em `ingest_jobs` com status `queued`.
+   Se `dedupeKey` ja existir, ela reutiliza o job anterior.
 6. API publica o payload na fila BullMQ usando o mesmo `jobId`.
 7. API responde `202 Accepted`.
 8. Worker consome o job.
@@ -202,6 +210,13 @@ Por que gravar `ingest_jobs` antes de publicar na fila?
 Isso permite rastrear a ingestao imediatamente. Se a publicacao na fila falhar,
 a API marca o job como `failed`, preservando uma pista operacional.
 
+Por que `dedupeKey`?
+
+Clientes podem reenviar eventos por timeout, retry de rede ou falha de
+confirmacao. Com `dedupeKey`, o banco garante uma unica ingestao logica via
+indice unico parcial. A API retorna o `jobId` existente e evita publicar um job
+duplicado.
+
 ## 7. Fluxo de Busca
 
 Endpoint:
@@ -215,6 +230,10 @@ Filtros:
 - `service`
 - `env`
 - `level`
+- `traceId`
+- `spanId`
+- `attrKey`
+- `attrValue`
 - `q`
 - `from`
 - `to`
@@ -248,6 +267,13 @@ Por que usar `id` junto com `ts`?
 
 Varios logs podem ter o mesmo timestamp. O `id` funciona como desempate
 deterministico e evita duplicar ou pular itens entre paginas.
+
+Como funcionam filtros por atributos?
+
+Quando so `attrKey` e enviado, a query usa o operador JSONB `?` para verificar
+existencia da chave. Quando `attrKey` e `attrValue` sao enviados juntos, a query
+usa `attrs @> $N::jsonb`, mantendo o valor parametrizado e evitando interpolar
+JSON vindo do usuario.
 
 ## 8. Busca Textual
 
@@ -337,6 +363,7 @@ Campos:
 - `processed_at`
 - `status`
 - `error`
+- `dedupe_key`: chave opcional para evitar ingestao duplicada.
 
 Estados:
 
@@ -350,6 +377,21 @@ Estados:
 Controla migrations ja aplicadas. O script `scripts/migrate.js` le arquivos
 `.sql` em ordem e registra cada migration aplicada.
 
+### 10.4 Tabela `ingest_dead_letters`
+
+Guarda falhas definitivas do Worker:
+
+- `job_id`
+- `queue_name`
+- `job_name`
+- `payload`
+- `error`
+- `attempts`
+- `failed_at`
+
+Ela e uma dead-letter table simples. O objetivo e permitir inspecao e futura
+rotina de reprocessamento sem introduzir outro componente.
+
 ## 11. Indices
 
 Indices atuais:
@@ -361,6 +403,10 @@ CREATE INDEX idx_logs_ts_desc ON logs (ts DESC, id DESC);
 CREATE INDEX idx_logs_message_fts ON logs USING GIN (to_tsvector('simple', message));
 CREATE INDEX idx_logs_attrs_gin ON logs USING GIN (attrs);
 CREATE INDEX idx_logs_trace_id ON logs (trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX idx_logs_span_id ON logs (span_id) WHERE span_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_ingest_jobs_dedupe_key
+  ON ingest_jobs (dedupe_key)
+  WHERE dedupe_key IS NOT NULL;
 ```
 
 Como explicar:
@@ -371,6 +417,8 @@ Como explicar:
 - `message_fts`: busca textual.
 - `attrs_gin`: prepara filtros futuros por JSONB.
 - `trace_id`: acelera correlacao por trace sem indexar valores nulos.
+- `span_id`: acelera correlacao por span sem indexar valores nulos.
+- `dedupe_key`: garante idempotencia apenas para chaves nao nulas.
 
 ## 12. Erros e Resiliencia
 
@@ -391,7 +439,8 @@ BullMQ tenta novamente ate 5 vezes com backoff exponencial.
 ### Falha definitiva no Worker
 
 O job e marcado como `failed`, `processed_at` e preenchido e `error` guarda a
-mensagem.
+mensagem. A falha tambem e registrada em `ingest_dead_letters`, com payload,
+erro e numero de tentativas.
 
 ### Dependencias indisponiveis
 
@@ -418,7 +467,22 @@ O que eu melhoraria em producao:
 - TLS terminando em proxy ou load balancer.
 - Separacao de permissoes de banco para API, Worker e migration.
 
-## 14. Docker e Operacao Local
+## 14. Metricas e Retencao
+
+`GET /metrics` expoe formato Prometheus com:
+
+- uptime do processo;
+- requests por metodo, rota e status;
+- contadores de ingestao aceita/falha;
+- estados da fila BullMQ quando Redis esta disponivel, incluindo jobs
+  concluidos e falhos.
+
+A retencao e feita por `npm run retention`. O script usa `RETENTION_DAYS` e
+`RETENTION_BATCH_SIZE` para deletar logs antigos em lotes. Isso e mais simples
+que particionamento, mas ja mostra preocupacao operacional com crescimento da
+tabela.
+
+## 15. Docker e Operacao Local
 
 O `docker-compose.yml` sobe:
 
@@ -437,7 +501,7 @@ A API e o Worker dependem de:
 Isso evita iniciar a aplicacao antes do banco estar pronto ou antes do schema
 existir.
 
-## 15. Testes
+## 16. Testes
 
 Ferramentas:
 
@@ -452,26 +516,33 @@ Cobertura:
 - Rejeicao de cursor incompleto.
 - Garantia de que stats aplica filtros em `byLevel` e `timeline`.
 - Teste de integracao de ingestao real quando `RUN_INTEGRATION=1`.
+- Filtros por trace, span e atributos.
+- Idempotencia por `dedupeKey`.
+- Metricas Prometheus.
+- Dead-letter tracking.
+- Retencao por tempo.
+- Smoke E2E contra stack real quando `npm run test:e2e` e executado.
 
 Por que alguns testes nao usam Redis/PostgreSQL real?
 
 Testes de contrato HTTP devem ser rapidos e deterministas. Redis/PostgreSQL real
 ficam para integracao, que o CI consegue rodar com services.
 
-## 16. CI
+## 17. CI
 
 O GitHub Actions:
 
 1. Sobe PostgreSQL.
 2. Sobe Redis.
 3. Instala dependencias com `npm ci`.
-4. Executa migrations.
-5. Roda a suite de testes com `RUN_INTEGRATION=1`.
+4. Roda `npm run lint`.
+5. Executa migrations.
+6. Roda a suite de testes com `RUN_INTEGRATION=1`.
 
 Isso valida nao so os handlers HTTP, mas tambem o caminho real de integracao
 quando as dependencias estao disponiveis.
 
-## 17. OpenAPI
+## 18. OpenAPI
 
 Arquivo:
 
@@ -487,6 +558,7 @@ O OpenAPI documenta:
 - Busca com filtros e cursor.
 - Detalhe por ID.
 - Estatisticas.
+- Metricas.
 - Schemas de erro.
 - API key opcional.
 
@@ -497,7 +569,7 @@ evita dependencias extras no runtime e nao polui as rotas com comentarios
 grandes. Em um time maior, eu poderia gerar parte da documentacao a partir dos
 schemas ou publicar Swagger UI em ambiente interno.
 
-## 18. Trade-offs
+## 19. Trade-offs
 
 ### PostgreSQL vs Elasticsearch
 
@@ -529,27 +601,37 @@ planejadas e indexadas com cuidado.
 O runner atual e suficiente para um projeto pequeno. Em producao, eu avaliaria
 locks, rollback, dry-run, observabilidade e ferramentas maduras de migration.
 
-## 19. Limitacoes Conhecidas
+### Dead-letter table vs dead-letter queue
 
-- Nao ha retencao ou particionamento por tempo.
-- Nao ha endpoint Prometheus.
-- Nao ha dead-letter queue explicita.
-- Nao ha busca por `attrs` exposta na API, apesar do indice GIN.
+Uma tabela e facil de consultar e encaixa no escopo atual. Uma fila morta
+separada faria sentido se houvesse reprocessamento automatizado, consumidores
+dedicados ou alto volume de falhas.
+
+### Retencao por delete vs particionamento
+
+O script de delete em lotes e simples e suficiente para demonstrar politica de
+retencao. Em alto volume, eu migraria para particionamento por tempo e drop de
+particoes antigas.
+
+## 20. Limitacoes Conhecidas
+
+- Retencao existe, mas ainda nao usa particionamento.
+- Dead-letter existe como tabela, nao como fila de reprocessamento.
+- O endpoint de metricas usa contadores em memoria; em multiplas replicas, a
+  agregacao fica a cargo do Prometheus.
 - Autenticacao e propositalmente simples.
 - OpenAPI e mantido manualmente.
 
-## 20. Melhorias Futuras
+## 21. Melhorias Futuras
 
 Prioridade alta:
 
-- Filtros por `traceId`, `spanId` e campos de `attrs`.
-- Endpoint de metricas Prometheus.
-- Dead-letter queue explicita.
+- Reprocessamento de itens em `ingest_dead_letters`.
 - Testes end-to-end com Testcontainers ou Compose automatizado.
+- Particionamento por tempo em `logs`.
 
 Prioridade media:
 
-- Particionamento mensal ou diario em `logs`.
 - Politica de retencao por ambiente.
 - Scopes por API key.
 - Dashboard simples de jobs falhos.
@@ -560,7 +642,7 @@ Prioridade baixa:
 - Geracao parcial de OpenAPI a partir dos schemas Zod.
 - Exportacao para outro backend analitico.
 
-## 21. Perguntas Provaveis de Entrevista
+## 22. Perguntas Provaveis de Entrevista
 
 ### Por que existe API e Worker separados?
 
@@ -598,9 +680,10 @@ idempotencia forte.
 
 ### A ingestao e idempotente?
 
-Parcialmente. Cada request gera novos `jobIds`. O Worker nao deduplica logs por
-conteudo. Para idempotencia real, eu adicionaria um `dedupeKey` opcional vindo
-do cliente e uma constraint unica.
+Sim, quando o cliente envia `dedupeKey`. A API usa uma constraint unica parcial
+em `ingest_jobs.dedupe_key`. Se a chave ja existir, ela retorna o `jobId`
+existente e nao publica outro job. Sem `dedupeKey`, cada request representa uma
+nova ingestao.
 
 ### Como escalar?
 
@@ -613,14 +696,17 @@ do cliente e uma constraint unica.
 
 ### Como observar esse servico?
 
-Hoje existem logs estruturados e health checks. Eu adicionaria:
+Hoje existem logs estruturados, health checks e `GET /metrics`. O endpoint
+exporta:
 
-- Metricas Prometheus.
 - Tamanho da fila.
-- Jobs processados por segundo.
-- Latencia de processamento.
 - Contagem de retries e falhas.
-- Tempo de queries.
+- Jobs concluidos/falhos por estado BullMQ.
+- Requests por rota/status.
+- Uptime do processo.
+
+Eu ainda adicionaria histogramas de latencia e tempo de queries em uma proxima
+iteracao.
 
 ### Como proteger multi-tenant?
 
@@ -628,21 +714,22 @@ Eu adicionaria tenant/service ownership, API keys com scopes, filtros obrigatori
 por tenant e talvez particionamento logico ou fisico dependendo do isolamento
 necessario.
 
-## 22. Roteiro de Explicacao de 5 Minutos
+## 23. Roteiro de Explicacao de 5 Minutos
 
 1. Comece pelo problema: centralizar logs de varios servicos.
 2. Mostre a arquitetura: API, fila, Worker, PostgreSQL.
 3. Explique ingestao: validacao, job, fila, `202 Accepted`, Worker.
 4. Explique busca: filtros parametrizados, FTS, keyset pagination.
 5. Explique stats: contagem por level e timeline.
-6. Explique operacao: Docker, migrations, health checks e CI.
+6. Explique operacao: Docker, migrations, health checks, metricas, retencao e CI.
 7. Feche com trade-offs: PostgreSQL vs Elasticsearch, BullMQ vs Kafka,
    consistencia eventual e proximas melhorias.
 
-## 23. Frase Final
+## 24. Frase Final
 
 "O projeto e pequeno o bastante para ser entendido rapido, mas inclui decisoes
 que aparecem em sistemas reais: contratos bem definidos, fila, processamento
-assincrono, persistencia estruturada, busca paginada, health checks, migrations,
-CI, Docker e documentacao OpenAPI. Eu consigo defender tanto a implementacao
-quanto os trade-offs."
+assincrono, idempotencia, dead-letter tracking, metricas, retencao,
+persistencia estruturada, busca paginada, health checks, migrations, CI, Docker
+e documentacao OpenAPI. Eu consigo defender tanto a implementacao quanto os
+trade-offs."

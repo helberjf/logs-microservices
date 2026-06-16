@@ -51,12 +51,18 @@ Por que essa arquitetura?
 
 - API REST com validacao de contratos.
 - Ingestao individual ou em lote, com limite de 500 logs por request.
+- Idempotencia opcional com `dedupeKey`.
 - Processamento assincrono via fila.
 - Status de ingestao: `queued`, `processing`, `processed`, `failed`.
-- Busca por `service`, `env`, `level`, texto, intervalo de tempo e cursor.
+- Busca por `service`, `env`, `level`, `traceId`, `spanId`, atributos JSON,
+  texto, intervalo de tempo e cursor.
 - Paginacao keyset com `cursorTs` e `cursorId`.
 - Estatisticas por level e timeline por bucket de tempo.
 - Health checks de liveness e readiness.
+- Metricas Prometheus em `GET /metrics`.
+- Dead-letter tracking em PostgreSQL para falhas definitivas do Worker.
+- Script de retencao por tempo com `npm run retention`.
+- Smoke test E2E para o stack Docker com `npm run test:e2e`.
 - OpenAPI/Swagger em `docs/openapi.yaml`.
 - Documentacao tecnica para entrevista em `ENTREVISTA_TECNICA.md`.
 
@@ -75,6 +81,7 @@ Endpoints documentados:
 
 - `GET /health/liveness`
 - `GET /health/readiness`
+- `GET /metrics`
 - `POST /v1/logs`
 - `GET /v1/logs`
 - `GET /v1/logs/ingest/{jobId}`
@@ -99,6 +106,8 @@ Variaveis:
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/logs?sslmode=disable` | Conexao PostgreSQL |
 | `REDIS_URL` | `redis://localhost:6379` | Conexao Redis |
 | `QUEUE_NAME` | `logs-ingest` | Nome da fila BullMQ; evite `:` no nome |
+| `RETENTION_DAYS` | `30` | Janela de retencao usada por `npm run retention` |
+| `RETENTION_BATCH_SIZE` | `1000` | Tamanho de lote para limpeza de logs antigos |
 
 ## Rodando com Docker Compose
 
@@ -158,6 +167,8 @@ curl -X POST http://localhost:3000/v1/logs \
     "level": "info",
     "message": "payment approved",
     "traceId": "trace-123",
+    "spanId": "span-456",
+    "dedupeKey": "billing-api:A1:approved",
     "attrs": {
       "orderId": "A1",
       "userId": "U9"
@@ -171,6 +182,17 @@ Resposta:
 {
   "accepted": 1,
   "jobIds": ["4df7e9c5-d52f-41f8-bdd2-61c9163f8d55"]
+}
+```
+
+Se o mesmo `dedupeKey` for enviado novamente, a API retorna o `jobId`
+existente e nao publica um segundo job na fila:
+
+```json
+{
+  "accepted": 1,
+  "jobIds": ["4df7e9c5-d52f-41f8-bdd2-61c9163f8d55"],
+  "duplicates": 1
 }
 ```
 
@@ -198,6 +220,14 @@ Resposta esperada depois do Worker processar:
 curl "http://localhost:3000/v1/logs?service=billing-api&level=info&q=payment&limit=50"
 ```
 
+Filtros adicionais de observabilidade:
+
+```bash
+curl "http://localhost:3000/v1/logs?traceId=trace-123&spanId=span-456"
+curl "http://localhost:3000/v1/logs?attrKey=orderId&attrValue=A1"
+curl "http://localhost:3000/v1/logs?attrKey=orderId"
+```
+
 A resposta inclui `nextCursor` quando existe uma proxima pagina. Para continuar,
 envie `cursorTs` e `cursorId` juntos:
 
@@ -216,6 +246,31 @@ Retorna:
 - `byLevel`: contagem por severidade.
 - `timeline`: contagem por bucket de tempo e severidade.
 
+### Metricas
+
+```bash
+curl http://localhost:3000/metrics
+```
+
+O endpoint usa formato de texto Prometheus e inclui:
+
+- uptime do processo;
+- requests HTTP por metodo, rota e status;
+- logs aceitos/falhas de enqueue;
+- contagem de jobs BullMQ por estado quando Redis esta disponivel, incluindo
+  `completed` e `failed`.
+
+### Retencao
+
+Para limpar logs antigos de acordo com `RETENTION_DAYS`:
+
+```bash
+npm run retention
+```
+
+O script remove em lotes (`RETENTION_BATCH_SIZE`) para evitar deletar uma tabela
+grande em uma unica operacao.
+
 ## Modelo de Dados
 
 As migrations ficam em `migrations/`.
@@ -224,6 +279,7 @@ Tabelas:
 
 - `logs`: eventos persistidos, com campos estruturados e colunas JSONB.
 - `ingest_jobs`: rastreia o ciclo de vida dos jobs assincronos.
+- `ingest_dead_letters`: guarda jobs que falharam definitivamente no Worker.
 - `schema_migrations`: registra migrations aplicadas.
 
 Indices principais:
@@ -234,20 +290,25 @@ Indices principais:
 - GIN em `to_tsvector('simple', message)` para busca textual.
 - GIN em `attrs` para evolucao futura de filtros por JSONB.
 - Indice parcial em `trace_id` para correlacao distribuida.
+- Indice parcial em `span_id` para correlacao por span.
+- Indice unico parcial em `ingest_jobs.dedupe_key` para idempotencia.
 
 ## Testes e Qualidade
 
 ```bash
 npm test
 npm run lint
+npm run test:e2e
 ```
 
 Os testes HTTP usam Vitest e Supertest. Eles validam contratos sem abrir um
 servidor real. O teste de integracao completa fica protegido por
 `RUN_INTEGRATION=1`, pois depende de PostgreSQL e Redis.
 
-No CI, o GitHub Actions sobe PostgreSQL e Redis, roda as migrations e executa a
-suite de testes.
+O smoke E2E (`npm run test:e2e`) espera o stack completo rodando em
+`http://localhost:3000`, por exemplo via `docker compose up --build`. No CI, o
+GitHub Actions roda lint, sobe PostgreSQL e Redis, roda as migrations e executa
+a suite de testes.
 
 ## Estrutura
 
@@ -273,7 +334,9 @@ migrations/
 docs/
   openapi.yaml
 scripts/
+  e2e-smoke.js
   migrate.js
+  retention.js
 test/
 ```
 
@@ -283,10 +346,11 @@ Um bom resumo:
 
 > "Eu construi um pipeline de logs com API REST, fila e Worker. A API valida o
 > payload com Zod, registra um job no PostgreSQL e publica no BullMQ. O Worker
-> consome da fila com retry/backoff, persiste o log e atualiza o status. A busca
-> usa filtros SQL parametrizados, full-text search simples e paginacao keyset.
-> Tambem inclui migrations, Docker Compose, health checks, CI, testes e contrato
-> OpenAPI."
+> consome da fila com retry/backoff, persiste o log e atualiza o status. A API
+> tem idempotencia por dedupeKey, dead-letter tracking, metricas Prometheus,
+> retencao por tempo e busca com filtros SQL parametrizados, full-text search
+> simples e paginacao keyset. Tambem inclui migrations, Docker Compose, CI,
+> testes e contrato OpenAPI."
 
 Para uma explicacao detalhada, leia:
 

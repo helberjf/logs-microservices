@@ -5,8 +5,12 @@ import cors from "cors";
 import { logger } from "../lib/logger.js";
 import { config } from "../lib/config.js";
 import { pool } from "../lib/db.js";
-import { closeIngestQueue } from "../lib/queue.js";
+import { closeIngestQueue, getIngestQueue } from "../lib/queue.js";
 import { redis } from "../lib/redis.js";
+import {
+  observeApiRequest,
+  renderPrometheusMetrics,
+} from "../lib/metrics.js";
 import { healthRouter } from "./routes/health.js";
 import { logsRouter } from "./routes/logs.js";
 import { statsRouter } from "./routes/stats.js";
@@ -18,6 +22,7 @@ export function buildServer() {
   app.use(cors({ origin: true }));
   app.use(rateLimit({ limit: 600, windowMs: 60 * 1000 }));
   app.use(express.json({ limit: "1mb" }));
+  app.use(observeApiRequest);
 
   app.use((req, res, next) => {
     if (!config.apiKey) return next();
@@ -28,6 +33,15 @@ export function buildServer() {
   });
 
   app.use("/health", healthRouter);
+  app.get("/metrics", async (_req, res) => {
+    const queueCounts = await getIngestQueue()
+      .getJobCounts("waiting", "active", "delayed", "completed", "failed")
+      .catch(() => null);
+
+    res
+      .type("text/plain; version=0.0.4; charset=utf-8")
+      .send(renderPrometheusMetrics({ queueCounts }));
+  });
   app.use("/v1/logs", logsRouter);
   app.use("/v1/stats", statsRouter);
 

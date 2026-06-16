@@ -19,6 +19,8 @@ tags:
     description: Log ingestion, ingest job status, search, and detail lookup
   - name: Stats
     description: Aggregations for operational analysis
+  - name: Metrics
+    description: Prometheus-compatible operational metrics
 
 security:
   - {}
@@ -94,6 +96,7 @@ paths:
                   level: info
                   message: payment approved
                   traceId: trace-123
+                  dedupeKey: billing-api:A1:approved
                   attrs:
                     orderId: A1
                     userId: U9
@@ -105,6 +108,7 @@ paths:
                     env: prod
                     level: info
                     message: payment approved
+                    dedupeKey: billing-api:A1:approved
                   - ts: "2026-03-02T10:01:00.000Z"
                     service: billing-api
                     env: prod
@@ -139,6 +143,38 @@ paths:
         - $ref: "#/components/parameters/Service"
         - $ref: "#/components/parameters/Env"
         - $ref: "#/components/parameters/Level"
+        - name: traceId
+          in: query
+          description: Exact distributed trace identifier
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+          example: trace-123
+        - name: spanId
+          in: query
+          description: Exact distributed span identifier
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+          example: span-456
+        - name: attrKey
+          in: query
+          description: JSON attribute key to match in attrs
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 120
+          example: orderId
+        - name: attrValue
+          in: query
+          description: Optional JSON attribute value; requires attrKey
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 500
+          example: A1
         - name: q
           in: query
           description: Full-text search term applied to the message field
@@ -258,6 +294,27 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Export Prometheus text metrics
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP logs_process_uptime_seconds Process uptime in seconds.
+                # TYPE logs_process_uptime_seconds gauge
+                logs_process_uptime_seconds 12.345
+                logs_api_requests_total{method="GET",route="/health/liveness",status="200"} 1
+                logs_queue_jobs{state="waiting"} 0
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /v1/stats:
     get:
@@ -416,6 +473,12 @@ components:
           type: string
           maxLength: 128
           example: span-456
+        dedupeKey:
+          type: string
+          minLength: 1
+          maxLength: 180
+          description: Optional idempotency key. Duplicate keys reuse the first job.
+          example: billing-api:A1:approved
         attrs:
           $ref: "#/components/schemas/JsonObject"
         context:
@@ -438,6 +501,11 @@ components:
             type: string
           example:
             - 4df7e9c5-d52f-41f8-bdd2-61c9163f8d55
+        duplicates:
+          type: integer
+          minimum: 1
+          description: Present when one or more dedupeKey values reused existing jobs
+          example: 1
 
     IngestStatus:
       type: string
