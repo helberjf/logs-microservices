@@ -4,9 +4,50 @@
 
 A backend microservice for **ingesting, asynchronously processing, storing, searching and aggregating structured logs**.
 
+<<<<<<< HEAD
 The project models a small observability platform: multiple applications ship logs over HTTP, the API validates and enqueues the events, a Worker persists them to PostgreSQL, and the API exposes endpoints for search, detail lookup, ingestion status and statistics.
 
 ## Overview
+=======
+## 🏗️ System Architecture & Data Flow
+
+This microservice is designed for high-throughput, fault-tolerant event logging. It guarantees zero data loss through idempotency checks, asynchronous processing, and dead-letter queue (DLQ) fallbacks.
+
+```mermaid
+flowchart LR
+    %% Define Styles for a modern, professional look
+    classDef client fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#333;
+    classDef api fill:#e1f5fe,stroke:#0288d1,stroke-width:2px,color:#01579b;
+    classDef queue fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#e65100;
+    classDef worker fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#1b5e20;
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#4a148c;
+    classDef monitor fill:#ffebee,stroke:#d32f2f,stroke-width:2px,color:#b71c1c;
+
+    %% Nodes
+    Client[Client App / External Services]:::client
+    API[API Gateway\nExpress 5 + OpenAPI]:::api
+    Idempotency{Idempotency\nCheck}:::api
+    Queue[(BullMQ / Redis\nJob Queue)]:::queue
+    Worker[Background Worker\nNode.js]:::worker
+    DB[(PostgreSQL\nPrimary Storage)]:::db
+    DLQ[(Dead Letter Queue\nFailed Jobs)]:::queue
+    Prometheus[Prometheus\nMetrics & Alerts]:::monitor
+
+    %% Flow
+    Client -->|HTTP POST /logs| API
+    API --> Idempotency
+    Idempotency -->|Duplicate Request| Client
+    Idempotency -->|Valid New Request| Queue
+    Queue -->|Consume Job| Worker
+    
+    Worker -->|Success: Persist Log| DB
+    Worker -->|Fail: Max Retries Exceeded| DLQ
+    
+    Worker -.->|Expose /metrics| Prometheus
+    API -.->|Expose /metrics| Prometheus
+
+## Visao Geral
+>>>>>>> c7d592c (fix: updating readme)
 
 ```text
 Client
