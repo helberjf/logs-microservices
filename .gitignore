@@ -3,3 +3,17 @@ node_modules
 .DS_Store
 .vscode
 .idea
+
+# Local AI assistant files
+.claude/
+.openclaw/
+.superpowers/
+docs/superpowers/
+AGENTS.md
+SOUL.md
+IDENTITY.md
+USER.md
+HEARTBEAT.md
+TOOLS.md
+memory/
+ENTREVISTA_TECNICA.md

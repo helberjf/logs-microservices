@@ -126,7 +126,7 @@ See the [OpenAPI contract](docs/openapi.yaml) for payloads and query parameters.
 
 ## Engineering tradeoffs
 
-These tradeoffs explain the current implementation and its constraints. The [hardening design](docs/superpowers/specs/2026-06-16-observability-hardening-design.md) records the scope decisions for dead-letter storage, retention, metrics and search; the comparisons below are not benchmark claims.
+These tradeoffs explain the current implementation and its constraints; the comparisons below are not benchmark claims.
 
 | Choice | Benefit | Cost or boundary; when to revisit |
 | --- | --- | --- |
@@ -200,7 +200,7 @@ A short review path through the implementation:
 4. [Database migrations](migrations) — tables, JSONB/full-text indexes and dedupe constraint.
 5. [Tests](test), [smoke script](scripts/e2e-smoke.js) and [OpenAPI](docs/openapi.yaml) — expected behavior and executable entry points.
 
-Additional documentation: [operating guide](GUIDE.md) and [technical interview notes](ENTREVISTA_TECNICA.md) (Portuguese).
+Additional documentation: [operating guide](GUIDE.md).
 
 ## License
 
