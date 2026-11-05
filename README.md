@@ -1,7 +1,5 @@
 # Logs Microservices
 
-[![CI](https://github.com/helberjf/logs-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/helberjf/logs-microservices/actions/workflows/ci.yml)
-
 An asynchronous log ingestion and search service built with **Node.js, Express, BullMQ, Redis and PostgreSQL**. Applications submit structured events over HTTP, track processing by job ID, and query persisted logs by service, severity, trace or attributes.
 
 **Start here:** [Architecture](#architecture) · [Quick start](#quick-start) · [Try the API](#try-the-api) · [Engineering tradeoffs](#engineering-tradeoffs) · [Tests](#tests-and-quality) · [OpenAPI](docs/openapi.yaml)
